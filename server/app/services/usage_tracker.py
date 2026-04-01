@@ -43,7 +43,6 @@ class UsageTracker:
         settings = get_settings()
         self._engine = create_engine(settings.database_url, future=True)
         self._session_factory = sessionmaker(self._engine, expire_on_commit=False, class_=Session)
-        Base.metadata.create_all(self._engine)
 
     def _db(self) -> Session:
         return self._session_factory()
