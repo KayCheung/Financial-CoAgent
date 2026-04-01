@@ -1,4 +1,4 @@
-﻿from functools import lru_cache
+from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -12,8 +12,11 @@ class Settings(BaseSettings):
 
     app_name: str = "Financial-CoAgent Gateway"
     api_v1_prefix: str = "/api/v1"
-    anthropic_api_key: str | None = None
-    anthropic_model: str = "claude-sonnet-4-20250514"
+    openai_api_key: str | None = None
+    openai_base_url: str | None = None
+    openai_model: str = "gpt-4o-mini"
+    database_url: str = "sqlite:///./coagent.db"
+    upload_dir: str = "./uploads"
 
     # S1 dev auth: replace with OIDC / enterprise SSO in S6.
     dev_bearer_token: str = "dev-local-token"

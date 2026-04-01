@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Literal
@@ -30,6 +30,7 @@ class SessionOut(BaseModel):
     title: str
     session_type: SessionType
     status: SessionStatus
+    pinned: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -39,9 +40,29 @@ class SessionListResponse(BaseModel):
     total: int
 
 
+class SessionMessageOut(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: str
+    message_type: str = "text"
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    token_usage: dict[str, Any] | None = None
+    run_id: str | None = None
+    id: str | None = None
+    created_at: datetime
+
+
+class SessionMessageListResponse(BaseModel):
+    items: list[SessionMessageOut]
+    total: int
+    next_cursor: str | None = None
+    has_more: bool = False
+
+
 class ChatStreamRequest(BaseModel):
     session_id: str
     message: str
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    last_event_id: str | None = None
 
 
 class ChatInterruptRequest(BaseModel):
@@ -51,6 +72,20 @@ class ChatInterruptRequest(BaseModel):
 class ChatResumeRequest(BaseModel):
     session_id: str
     resume_token: str
+    last_event_id: str | None = None
+
+
+class SessionUpdateRequest(BaseModel):
+    title: str | None = None
+    pinned: bool | None = None
+
+
+class AttachmentOut(BaseModel):
+    attachment_id: str
+    file_name: str
+    mime_type: str
+    size_bytes: int
+    file_url: str
 
 
 class UsageSummaryItem(BaseModel):

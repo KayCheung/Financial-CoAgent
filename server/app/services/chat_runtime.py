@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
@@ -42,7 +42,22 @@ class ChatRuntime:
             return True
 
     def get_checkpoint(self, resume_token: str) -> Checkpoint | None:
-        return self._checkpoints.get(resume_token)
+        cp = self._checkpoints.get(resume_token)
+        if cp:
+            return cp
+        row = session_store.get_checkpoint(resume_token)
+        if not row:
+            return None
+        return Checkpoint(
+            resume_token=row["resume_token"],
+            session_id=row["session_id"],
+            partial_assistant_text=row["partial_assistant_text"],
+            user_message_snapshot=row["user_message_snapshot"],
+            created_at=row["created_at"],
+        )
+
+    def get_stage_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        return session_store.get_stage_snapshot(session_id)
 
     @staticmethod
     def _full_stub_reply(user_text: str) -> str:
@@ -64,11 +79,31 @@ class ChatRuntime:
         user_id: str,
         session_id: str,
         user_message: str,
+        attachments: list[dict[str, Any]] | None,
         resume_token: str | None,
+        last_event_id: str | None = None,
     ):
         session = session_store.get(session_id)
         if not session or session.owner_id != user_id:
             yield self._sse({"type": "error", "detail": "session_not_found"})
+            return
+        existing = session_store.get_stage_snapshot(session_id) or {}
+        if (
+            last_event_id
+            and existing.get("last_event_id") == last_event_id
+            and existing.get("status") in {"completed", "failed", "interrupted"}
+        ):
+            yield self._event(
+                event_type="completed",
+                session_id=session_id,
+                thread_id=existing.get("thread_id") or session_id,
+                run_id=existing.get("run_id") or str(uuid.uuid4()),
+                trace_id=existing.get("trace_id") or str(uuid.uuid4()),
+                payload={
+                    "status": existing.get("status") or "completed",
+                    "final_answer": existing.get("final_answer") or "",
+                },
+            )
             return
 
         append_user = resume_token is None
@@ -84,6 +119,8 @@ class ChatRuntime:
             sent_prefix = ""
 
         run_id = str(uuid.uuid4())
+        trace_id = str(uuid.uuid4())
+        thread_id = session_id
         cancel = asyncio.Event()
         async with self._lock:
             prev = self._active.get(session_id)
@@ -92,16 +129,65 @@ class ChatRuntime:
             self._active[session_id] = ActiveRun(run_id=run_id, cancel=cancel)
 
         if append_user:
-            session_store.append_message(session_id, ChatMessage(role="user", content=user_message))
+            session_store.append_message(
+                session_id,
+                ChatMessage(
+                    role="user",
+                    content=user_message,
+                    message_type="text+attachments" if attachments else "text",
+                    attachments=attachments or [],
+                    run_id=run_id,
+                ),
+            )
             session_store.touch(session_id)
 
         output_parts: list[str] = []
-        history = [m for m in session.messages if m.role in ("user", "assistant")]
+        history_rows, _, _ = session_store.list_messages_before(session_id, None, 200)
+        history = [m for m in history_rows if m.role in ("user", "assistant")]
         input_toks = estimate_tokens(" ".join(m.content for m in history))
 
         try:
-            yield self._sse({"type": "run_start", "run_id": run_id, "session_id": session_id})
+            yield self._event(
+                event_type="stage_started",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={
+                    "stage_key": "planner",
+                    "stage_label": "任务规划",
+                    "status": "running",
+                    "started_at": self._now_iso(),
+                },
+            )
+            yield self._event(
+                event_type="stage_completed",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={
+                    "stage_key": "planner",
+                    "status": "completed",
+                    "summary": "完成上下文与工具策略规划",
+                    "ended_at": self._now_iso(),
+                },
+            )
+            yield self._event(
+                event_type="stage_started",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={
+                    "stage_key": "responder",
+                    "stage_label": "生成回复",
+                    "status": "running",
+                    "started_at": self._now_iso(),
+                },
+            )
             try:
+                progress_emitted = False
                 async for piece in agent_orchestrator.stream(
                     StreamInput(
                         session_id=session_id,
@@ -120,31 +206,111 @@ class ChatRuntime:
                             partial_assistant_text=partial,
                             user_message_snapshot=user_snapshot,
                         )
-                        yield self._sse(
-                            {
-                                "type": "checkpoint",
+                        session_store.save_checkpoint(
+                            resume_token=tok,
+                            session_id=session_id,
+                            partial_assistant_text=partial,
+                            user_message_snapshot=user_snapshot,
+                        )
+                        yield self._event(
+                            event_type="stage_failed",
+                            session_id=session_id,
+                            thread_id=thread_id,
+                            run_id=run_id,
+                            trace_id=trace_id,
+                            payload={
+                                "stage_key": "responder",
+                                "status": "failed",
+                                "error_code": "INTERRUPTED",
+                                "error_message": "用户主动中断当前生成",
+                                "retryable": True,
+                            },
+                        )
+                        yield self._event(
+                            event_type="checkpoint",
+                            session_id=session_id,
+                            thread_id=thread_id,
+                            run_id=run_id,
+                            trace_id=trace_id,
+                            payload={
                                 "resume_token": tok,
                                 "partial_length": len(partial),
                                 "reason": "interrupted",
-                            }
+                            },
                         )
-                        yield self._sse({"type": "done", "status": "interrupted"})
+                        yield self._event(
+                            event_type="completed",
+                            session_id=session_id,
+                            thread_id=thread_id,
+                            run_id=run_id,
+                            trace_id=trace_id,
+                            payload={"status": "interrupted", "final_answer": partial},
+                        )
                         return
                     output_parts.append(piece)
-                    yield self._sse({"type": "token", "text": piece})
+                    if not progress_emitted:
+                        progress_emitted = True
+                        yield self._event(
+                            event_type="stage_progress",
+                            session_id=session_id,
+                            thread_id=thread_id,
+                            run_id=run_id,
+                            trace_id=trace_id,
+                            payload={
+                                "stage_key": "responder",
+                                "summary": "正在流式生成答案",
+                                "percent": 60,
+                            },
+                        )
+                    yield self._event(
+                        event_type="token",
+                        session_id=session_id,
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        trace_id=trace_id,
+                        payload={"text": piece},
+                    )
             except Exception as sdk_exc:
-                yield self._sse({"type": "error", "detail": f"llm_unavailable: {sdk_exc}"})
+                yield self._event(
+                    event_type="error",
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    trace_id=trace_id,
+                    payload={
+                        "status": "failed",
+                        "error_code": "LLM_UNAVAILABLE",
+                        "error_message": f"llm_unavailable: {sdk_exc}",
+                        "recoverable": True,
+                    },
+                )
                 async for piece in self._stream_stub(user_snapshot, sent_prefix):
                     if cancel.is_set():
                         break
                     output_parts.append(piece)
-                    yield self._sse({"type": "token", "text": piece})
+                    yield self._event(
+                        event_type="token",
+                        session_id=session_id,
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        trace_id=trace_id,
+                        payload={"text": piece},
+                    )
 
             final = sent_prefix + "".join(output_parts)
-            session_store.append_message(session_id, ChatMessage(role="assistant", content=final))
+            out_toks = estimate_tokens(final)
+            session_store.append_message(
+                session_id,
+                ChatMessage(
+                    role="assistant",
+                    content=final,
+                    message_type="text",
+                    token_usage={"input_tokens": input_toks, "output_tokens": out_toks},
+                    run_id=run_id,
+                ),
+            )
             session_store.touch(session_id)
 
-            out_toks = estimate_tokens(final)
             cost = stub_cost_usd(input_toks, out_toks)
             usage_tracker.record(
                 user_id=user_id,
@@ -152,25 +318,219 @@ class ChatRuntime:
                 input_tokens=input_toks,
                 output_tokens=out_toks,
                 cost_usd=cost,
-                model="claude-agent-sdk",
+                model="langchain-chat",
             )
-            yield self._sse(
-                {
-                    "type": "cost_event",
+            yield self._event(
+                event_type="stage_completed",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={
+                    "stage_key": "responder",
+                    "status": "completed",
+                    "summary": "回复生成完成",
+                    "ended_at": self._now_iso(),
+                },
+            )
+            yield self._event(
+                event_type="cost_event",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={
                     "input_tokens": input_toks,
                     "output_tokens": out_toks,
+                    "total_tokens": input_toks + out_toks,
+                    "total_cost": cost,
+                    "currency": "USD",
                     "cost_usd": cost,
-                }
+                },
             )
-            yield self._sse({"type": "done", "status": "completed"})
+            yield self._event(
+                event_type="completed",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={"status": "completed", "final_answer": final},
+            )
+            if resume_token:
+                session_store.mark_checkpoint_consumed(resume_token)
         except Exception as exc:
-            yield self._sse({"type": "error", "detail": str(exc)})
-            yield self._sse({"type": "done", "status": "failed"})
+            yield self._event(
+                event_type="error",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={
+                    "status": "failed",
+                    "error_code": "GRAPH_RUNTIME_ERROR",
+                    "error_message": str(exc),
+                    "recoverable": True,
+                },
+            )
+            yield self._event(
+                event_type="completed",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={"status": "failed"},
+            )
         finally:
             async with self._lock:
                 cur = self._active.get(session_id)
                 if cur and cur.run_id == run_id:
                     self._active.pop(session_id, None)
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _event(
+        self,
+        *,
+        event_type: str,
+        session_id: str,
+        thread_id: str,
+        run_id: str,
+        trace_id: str,
+        payload: dict[str, Any],
+    ) -> str:
+        event = {
+            "event_id": f"evt_{uuid.uuid4().hex}",
+            "event_type": event_type,
+            "session_id": session_id,
+            "thread_id": thread_id,
+            "run_id": run_id,
+            "trace_id": trace_id,
+            "server_ts": ChatRuntime._now_iso(),
+            "payload": payload,
+            # Backward-compatible fields for old renderer parser
+            "type": event_type,
+            **payload,
+        }
+        self._update_stage_snapshot(event)
+        return ChatRuntime._sse(event)
+
+    def _update_stage_snapshot(self, event: dict[str, Any]) -> None:
+        session_id = event.get("session_id")
+        if not session_id:
+            return
+
+        payload = event.get("payload") or {}
+        event_type = event.get("event_type")
+        run = session_store.get_stage_snapshot(session_id)
+        if not run:
+            run = {
+                "session_id": session_id,
+                "thread_id": event.get("thread_id") or session_id,
+                "run_id": event.get("run_id"),
+                "status": "running",
+                "trace_id": event.get("trace_id"),
+                "stages": [],
+                "last_event_id": None,
+                "final_answer": "",
+                "updated_at": None,
+            }
+            session_store.set_stage_snapshot(session_id, run, event.get("event_id"))
+
+        run["run_id"] = event.get("run_id") or run.get("run_id")
+        run["trace_id"] = event.get("trace_id") or run.get("trace_id")
+        run["last_event_id"] = event.get("event_id")
+        run["updated_at"] = event.get("server_ts")
+
+        def upsert_stage(stage_patch: dict[str, Any]) -> None:
+            stage_key = stage_patch.get("stage_key")
+            if not stage_key:
+                return
+            stages = run["stages"]
+            idx = next((i for i, s in enumerate(stages) if s.get("stage_key") == stage_key), -1)
+            if idx < 0:
+                stages.append(
+                    {
+                        "stage_key": stage_key,
+                        "stage_label": stage_patch.get("stage_label") or stage_key,
+                        "status": stage_patch.get("status") or "pending",
+                        "started_at": stage_patch.get("started_at"),
+                        "ended_at": stage_patch.get("ended_at"),
+                        "duration_ms": stage_patch.get("duration_ms"),
+                        "tool_name": stage_patch.get("tool_name"),
+                        "summary": stage_patch.get("summary") or "",
+                        "error": stage_patch.get("error_message") or stage_patch.get("error"),
+                        "error_code": stage_patch.get("error_code"),
+                        "retryable": stage_patch.get("retryable"),
+                        "percent": stage_patch.get("percent"),
+                        "approval_payload": stage_patch.get("approval_payload"),
+                    }
+                )
+            else:
+                cur = stages[idx]
+                cur.update({k: v for k, v in stage_patch.items() if v is not None})
+                if stage_patch.get("error_message") or stage_patch.get("error"):
+                    cur["error"] = stage_patch.get("error_message") or stage_patch.get("error")
+
+        if event_type == "stage_started":
+            upsert_stage(
+                {
+                    "stage_key": payload.get("stage_key"),
+                    "stage_label": payload.get("stage_label"),
+                    "status": "running",
+                    "started_at": payload.get("started_at") or event.get("server_ts"),
+                }
+            )
+        elif event_type == "stage_progress":
+            upsert_stage(
+                {
+                    "stage_key": payload.get("stage_key"),
+                    "status": "running",
+                    "summary": payload.get("summary"),
+                    "percent": payload.get("percent"),
+                }
+            )
+        elif event_type == "stage_waiting_human":
+            upsert_stage(
+                {
+                    "stage_key": payload.get("stage_key"),
+                    "stage_label": payload.get("stage_label"),
+                    "status": "waiting_human",
+                    "approval_payload": payload.get("approval_payload"),
+                }
+            )
+            run["status"] = "waiting_human"
+        elif event_type == "stage_completed":
+            upsert_stage(
+                {
+                    "stage_key": payload.get("stage_key"),
+                    "status": "completed",
+                    "ended_at": payload.get("ended_at") or event.get("server_ts"),
+                    "duration_ms": payload.get("duration_ms"),
+                    "tool_name": payload.get("tool_name"),
+                    "summary": payload.get("summary"),
+                }
+            )
+        elif event_type == "stage_failed":
+            upsert_stage(
+                {
+                    "stage_key": payload.get("stage_key"),
+                    "status": "failed",
+                    "summary": payload.get("summary"),
+                    "error_message": payload.get("error_message"),
+                    "error_code": payload.get("error_code"),
+                    "retryable": payload.get("retryable"),
+                    "error": payload.get("error"),
+                }
+            )
+            run["status"] = "failed"
+        elif event_type == "completed":
+            run["status"] = payload.get("status") or "completed"
+            run["final_answer"] = payload.get("final_answer") or ""
+        elif event_type == "error":
+            run["status"] = "failed"
+        session_store.set_stage_snapshot(session_id, run, event.get("event_id"))
 
     @staticmethod
     def _sse(payload: dict[str, Any]) -> str:

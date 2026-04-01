@@ -1,1 +1,1 @@
-﻿"""Claude Agent SDK orchestrator package."""
+"""LangChain/LangGraph orchestrator package."""

@@ -1,4 +1,4 @@
-﻿const baseUrl = import.meta.env.VITE_GATEWAY_URL || 'http://127.0.0.1:8000'
+const baseUrl = import.meta.env.VITE_GATEWAY_URL || 'http://127.0.0.1:8000'
 const apiV1 = `${baseUrl}/api/v1`
 
 async function parseJson(res) {
@@ -25,9 +25,11 @@ export async function devLogin() {
   return parseJson(res)
 }
 
-export async function listSessions(token, { limit = 50, offset = 0 } = {}) {
-  const q = new URLSearchParams({ limit: String(limit), offset: String(offset) })
-  const res = await fetch(`${apiV1}/sessions?${q}`, {
+export async function listSessions(token, { limit = 50, offset = 0, q = '' } = {}) {
+  const qs = { limit: String(limit), offset: String(offset) }
+  if (q) qs.q = q
+  const qstr = new URLSearchParams(qs)
+  const res = await fetch(`${apiV1}/sessions?${qstr}`, {
     headers: { Authorization: `Bearer ${token}` }
   })
   return parseJson(res)
@@ -45,6 +47,43 @@ export async function createSession(token, { title = null, session_type = 'chat'
   return parseJson(res)
 }
 
+export async function updateSession(token, sessionId, payload = {}) {
+  const res = await fetch(`${apiV1}/sessions/${sessionId}`, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  })
+  return parseJson(res)
+}
+
+export async function deleteSession(token, sessionId) {
+  const res = await fetch(`${apiV1}/sessions/${sessionId}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` }
+  })
+  return parseJson(res)
+}
+
+export async function listSessionMessages(token, sessionId, { limit = 50, offset = 0, cursor = null } = {}) {
+  const query = { limit: String(limit), offset: String(offset) }
+  if (cursor) query.cursor = cursor
+  const q = new URLSearchParams(query)
+  const res = await fetch(`${apiV1}/sessions/${sessionId}/messages?${q}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  })
+  return parseJson(res)
+}
+
+export async function getSessionStages(token, sessionId) {
+  const res = await fetch(`${apiV1}/sessions/${sessionId}/stages`, {
+    headers: { Authorization: `Bearer ${token}` }
+  })
+  return parseJson(res)
+}
+
 export async function usageSummary(token) {
   const res = await fetch(`${apiV1}/usage/summary`, {
     headers: { Authorization: `Bearer ${token}` }
@@ -52,7 +91,18 @@ export async function usageSummary(token) {
   return parseJson(res)
 }
 
-export async function chatStream(token, { sessionId, message }, onSseData) {
+export async function uploadAttachment(token, file) {
+  const fd = new FormData()
+  fd.append('file', file)
+  const res = await fetch(`${apiV1}/files/upload`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: fd
+  })
+  return parseJson(res)
+}
+
+export async function chatStream(token, { sessionId, message, attachments = [], lastEventId = null }, onSseData) {
   const res = await fetch(`${apiV1}/chat/stream`, {
     method: 'POST',
     headers: {
@@ -60,7 +110,7 @@ export async function chatStream(token, { sessionId, message }, onSseData) {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream'
     },
-    body: JSON.stringify({ session_id: sessionId, message })
+    body: JSON.stringify({ session_id: sessionId, message, attachments, last_event_id: lastEventId })
   })
   if (!res.ok) {
     const text = await res.text()
@@ -69,7 +119,7 @@ export async function chatStream(token, { sessionId, message }, onSseData) {
   await consumeSse(res, onSseData)
 }
 
-export async function chatResume(token, { sessionId, resumeToken }, onSseData) {
+export async function chatResume(token, { sessionId, resumeToken, lastEventId = null }, onSseData) {
   const res = await fetch(`${apiV1}/chat/resume`, {
     method: 'POST',
     headers: {
@@ -77,7 +127,7 @@ export async function chatResume(token, { sessionId, resumeToken }, onSseData) {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream'
     },
-    body: JSON.stringify({ session_id: sessionId, resume_token: resumeToken })
+    body: JSON.stringify({ session_id: sessionId, resume_token: resumeToken, last_event_id: lastEventId })
   })
   if (!res.ok) {
     const text = await res.text()

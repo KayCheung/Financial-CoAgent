@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import Principal, get_principal
@@ -25,7 +25,9 @@ async def chat_stream(
         user_id=principal.user_id,
         session_id=payload.session_id,
         user_message=payload.message,
+        attachments=payload.attachments,
         resume_token=None,
+        last_event_id=payload.last_event_id,
     )
 
     async def sse():
@@ -45,7 +47,9 @@ async def chat_resume(
         user_id=principal.user_id,
         session_id=payload.session_id,
         user_message="",
+        attachments=[],
         resume_token=payload.resume_token,
+        last_event_id=payload.last_event_id,
     )
 
     async def sse():

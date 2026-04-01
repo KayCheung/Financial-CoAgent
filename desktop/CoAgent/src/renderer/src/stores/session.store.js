@@ -1,5 +1,5 @@
-﻿import { defineStore } from 'pinia'
-import { createSession, listSessions } from '../api/gateway'
+import { defineStore } from 'pinia'
+import { createSession, deleteSession, listSessions, updateSession } from '../api/gateway'
 import { useAuthStore } from './auth.store'
 
 export const useSessionStore = defineStore('session', {
@@ -7,6 +7,7 @@ export const useSessionStore = defineStore('session', {
     items: [],
     total: 0,
     currentId: null,
+    searchQuery: '',
     loading: false,
     error: null
   }),
@@ -17,7 +18,7 @@ export const useSessionStore = defineStore('session', {
       this.loading = true
       this.error = null
       try {
-        const data = await listSessions(auth.accessToken)
+        const data = await listSessions(auth.accessToken, { q: this.searchQuery || '' })
         this.items = data.items ?? []
         this.total = data.total ?? 0
         if (!this.currentId && this.items.length) {
@@ -41,6 +42,27 @@ export const useSessionStore = defineStore('session', {
     },
     select(id) {
       this.currentId = id
+    },
+    async rename(id, title) {
+      const auth = useAuthStore()
+      if (!auth.accessToken) return
+      await updateSession(auth.accessToken, id, { title })
+      await this.refresh()
+    },
+    async togglePin(id, pinned) {
+      const auth = useAuthStore()
+      if (!auth.accessToken) return
+      await updateSession(auth.accessToken, id, { pinned })
+      await this.refresh()
+    },
+    async remove(id) {
+      const auth = useAuthStore()
+      if (!auth.accessToken) return
+      await deleteSession(auth.accessToken, id)
+      if (this.currentId === id) {
+        this.currentId = null
+      }
+      await this.refresh()
     }
   }
 })
