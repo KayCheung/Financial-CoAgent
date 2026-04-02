@@ -483,7 +483,11 @@ async function onResume() {
   try {
     await chatResume(
       auth.accessToken,
-      { sessionId: currentId.value, resumeToken: lastResumeToken.value },
+      {
+        sessionId: currentId.value,
+        resumeToken: lastResumeToken.value,
+        lastEventId: currentRun.value?.last_event_id || null
+      },
       (ev) => {
         stages.applyEvent(ev)
         const eventType = ev.event_type || ev.type

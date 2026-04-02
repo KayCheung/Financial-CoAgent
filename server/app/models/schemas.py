@@ -60,7 +60,7 @@ class SessionMessageListResponse(BaseModel):
 
 class ChatStreamRequest(BaseModel):
     session_id: str
-    message: str
+    message: str = ""
     attachments: list[dict[str, Any]] = Field(default_factory=list)
     last_event_id: str | None = None
 

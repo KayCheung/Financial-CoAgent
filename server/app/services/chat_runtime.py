@@ -93,17 +93,51 @@ class ChatRuntime:
             and existing.get("last_event_id") == last_event_id
             and existing.get("status") in {"completed", "failed", "interrupted"}
         ):
-            yield self._event(
-                event_type="completed",
-                session_id=session_id,
-                thread_id=existing.get("thread_id") or session_id,
-                run_id=existing.get("run_id") or str(uuid.uuid4()),
-                trace_id=existing.get("trace_id") or str(uuid.uuid4()),
-                payload={
-                    "status": existing.get("status") or "completed",
-                    "final_answer": existing.get("final_answer") or "",
-                },
+            rid = existing.get("run_id") or str(uuid.uuid4())
+            tid = existing.get("trace_id") or str(uuid.uuid4())
+            status = existing.get("status") or "completed"
+            fa = existing.get("final_answer") or ""
+            yield ChatRuntime._sse(
+                {
+                    "event_id": last_event_id,
+                    "event_type": "completed",
+                    "session_id": session_id,
+                    "thread_id": existing.get("thread_id") or session_id,
+                    "run_id": rid,
+                    "trace_id": tid,
+                    "server_ts": ChatRuntime._now_iso(),
+                    "payload": {"status": status, "final_answer": fa},
+                    "type": "completed",
+                    "status": status,
+                    "final_answer": fa,
+                }
             )
+            return
+
+        um = (user_message or "").strip()
+        want_replay = bool(last_event_id and (resume_token is not None or not um))
+        replay_terminal_stop = False
+        if want_replay:
+            anchor = session_store.get_stream_event_by_id(last_event_id)
+            if anchor and anchor.get("session_id") == session_id:
+                run_r = anchor.get("run_id")
+                snap_run = existing.get("run_id")
+                if run_r and (snap_run is None or run_r == snap_run):
+                    after_seq = int(anchor.get("seq") or 0)
+                    rows = session_store.list_stream_events_after_seq(session_id, run_r, after_seq)
+                    for env in rows:
+                        yield ChatRuntime._sse(env)
+                        if env.get("event_type") in ("completed", "error"):
+                            replay_terminal_stop = True
+                    if not rows and not replay_terminal_stop:
+                        tip = session_store.get_last_stream_event_for_run(run_r)
+                        if (
+                            tip
+                            and tip.get("event_id") == last_event_id
+                            and tip.get("event_type") in ("completed", "error")
+                        ):
+                            replay_terminal_stop = True
+        if replay_terminal_stop:
             return
 
         append_user = resume_token is None
@@ -115,11 +149,19 @@ class ChatRuntime:
             user_snapshot = cp.user_message_snapshot
             sent_prefix = cp.partial_assistant_text
         else:
-            user_snapshot = user_message
+            user_snapshot = um
             sent_prefix = ""
 
-        run_id = str(uuid.uuid4())
-        trace_id = str(uuid.uuid4())
+        if resume_token is None and not um:
+            return
+
+        if resume_token:
+            snap_pre = session_store.get_stage_snapshot(session_id) or {}
+            run_id = snap_pre.get("run_id") or str(uuid.uuid4())
+            trace_id = snap_pre.get("trace_id") or str(uuid.uuid4())
+        else:
+            run_id = str(uuid.uuid4())
+            trace_id = str(uuid.uuid4())
         thread_id = session_id
         cancel = asyncio.Event()
         async with self._lock:
@@ -133,7 +175,7 @@ class ChatRuntime:
                 session_id,
                 ChatMessage(
                     role="user",
-                    content=user_message,
+                    content=um,
                     message_type="text+attachments" if attachments else "text",
                     attachments=attachments or [],
                     run_id=run_id,
@@ -400,8 +442,10 @@ class ChatRuntime:
         trace_id: str,
         payload: dict[str, Any],
     ) -> str:
+        seq = session_store.next_stream_seq(run_id)
         event = {
             "event_id": f"evt_{uuid.uuid4().hex}",
+            "seq": seq,
             "event_type": event_type,
             "session_id": session_id,
             "thread_id": thread_id,
@@ -413,6 +457,7 @@ class ChatRuntime:
             "type": event_type,
             **payload,
         }
+        session_store.append_stream_event(event)
         self._update_stage_snapshot(event)
         return ChatRuntime._sse(event)
 

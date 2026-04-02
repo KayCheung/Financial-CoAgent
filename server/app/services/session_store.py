@@ -63,6 +63,18 @@ class CheckpointModel(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class StreamEventModel(Base):
+    __tablename__ = "stream_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    run_id: Mapped[str] = mapped_column(String(64), index=True)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    envelope_json: Mapped[str] = mapped_column(Text, nullable=False)
+    server_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 @dataclass
 class ChatMessage:
     role: Literal["user", "assistant", "system"]
@@ -92,8 +104,12 @@ class SessionStore:
     def __init__(self) -> None:
         settings = get_settings()
         db_url = getattr(settings, "database_url", None) or "sqlite:///./coagent.db"
-        self._engine = create_engine(db_url, future=True)
+        connect_args: dict = {}
+        if isinstance(db_url, str) and db_url.startswith("sqlite"):
+            connect_args["check_same_thread"] = False
+        self._engine = create_engine(db_url, future=True, connect_args=connect_args)
         self._session_factory = sessionmaker(self._engine, expire_on_commit=False, class_=Session)
+        self._seq_cursor: dict[str, int] = {}
 
     def _db(self) -> Session:
         return self._session_factory()
@@ -173,6 +189,7 @@ class SessionStore:
             if not row:
                 return False
             db.query(SessionMessageModel).filter(SessionMessageModel.session_id == session_id).delete()
+            db.query(StreamEventModel).filter(StreamEventModel.session_id == session_id).delete()
             db.query(StageSnapshotModel).filter(StageSnapshotModel.session_id == session_id).delete()
             db.query(CheckpointModel).filter(CheckpointModel.session_id == session_id).delete()
             db.delete(row)
@@ -349,6 +366,73 @@ class SessionStore:
                 return
             row.consumed_at = datetime.now(timezone.utc)
             db.commit()
+
+    def max_stream_seq_for_run(self, run_id: str) -> int:
+        with self._db() as db:
+            m = db.scalar(select(func.coalesce(func.max(StreamEventModel.seq), 0)).where(StreamEventModel.run_id == run_id))
+            return int(m or 0)
+
+    def next_stream_seq(self, run_id: str) -> int:
+        if run_id not in self._seq_cursor:
+            self._seq_cursor[run_id] = self.max_stream_seq_for_run(run_id)
+        self._seq_cursor[run_id] += 1
+        return self._seq_cursor[run_id]
+
+    def append_stream_event(self, envelope: dict[str, Any]) -> None:
+        ts_raw = envelope.get("server_ts")
+        if isinstance(ts_raw, str):
+            try:
+                server_ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except ValueError:
+                server_ts = datetime.now(timezone.utc)
+        elif isinstance(ts_raw, datetime):
+            server_ts = ts_raw
+        else:
+            server_ts = datetime.now(timezone.utc)
+        with self._db() as db:
+            row = StreamEventModel(
+                event_id=envelope["event_id"],
+                session_id=envelope["session_id"],
+                run_id=envelope["run_id"],
+                seq=int(envelope["seq"]),
+                event_type=envelope["event_type"],
+                envelope_json=json.dumps(envelope, ensure_ascii=False),
+                server_ts=server_ts,
+            )
+            db.add(row)
+            db.commit()
+
+    def get_stream_event_by_id(self, event_id: str) -> dict[str, Any] | None:
+        with self._db() as db:
+            row = db.scalars(select(StreamEventModel).where(StreamEventModel.event_id == event_id)).first()
+            if not row:
+                return None
+            return json.loads(row.envelope_json)
+
+    def list_stream_events_after_seq(self, session_id: str, run_id: str, after_seq: int) -> list[dict[str, Any]]:
+        with self._db() as db:
+            rows = db.scalars(
+                select(StreamEventModel)
+                .where(
+                    StreamEventModel.session_id == session_id,
+                    StreamEventModel.run_id == run_id,
+                    StreamEventModel.seq > after_seq,
+                )
+                .order_by(StreamEventModel.seq.asc())
+            ).all()
+            return [json.loads(r.envelope_json) for r in rows]
+
+    def get_last_stream_event_for_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._db() as db:
+            row = db.scalars(
+                select(StreamEventModel)
+                .where(StreamEventModel.run_id == run_id)
+                .order_by(StreamEventModel.seq.desc())
+                .limit(1)
+            ).first()
+            if not row:
+                return None
+            return json.loads(row.envelope_json)
 
 
 session_store = SessionStore()
