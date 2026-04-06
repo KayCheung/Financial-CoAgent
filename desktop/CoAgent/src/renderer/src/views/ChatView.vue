@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { useAuthStore } from '../stores/auth.store'
@@ -37,8 +37,11 @@ const hasMoreHistory = ref(false)
 const sendState = ref('idle')
 const showScrollToBottom = ref(false)
 
-const leftCollapsed = ref(false)
+const railWidth = 52
+const leftPanelCollapsed = ref(false)
 const rightCollapsed = ref(false)
+const railMenuOpen = ref(false)
+const sessionSearchInputRef = ref(null)
 const leftWidth = ref(260)
 const rightWidth = ref(320)
 const dragState = ref(null)
@@ -46,8 +49,6 @@ const isNarrowScreen = ref(false)
 const rightDrawerOpen = ref(false)
 const sessionSearch = ref('')
 const openSessionMenuId = ref(null)
-const isDev = import.meta.env.DEV
-
 const currentId = computed(() => sessions.currentId)
 const currentRun = computed(() => {
   if (!currentId.value) return null
@@ -85,6 +86,20 @@ const sessionUsed = computed(() => {
 const sessionUsedPercent = computed(() => {
   const ratio = sessionUsed.value.total / sessionTokenBudget
   return Math.max(0, Math.min(1, ratio))
+})
+
+const globalUsagePercent = computed(() => {
+  const t = usage.totals
+  if (!t) return 0
+  const total = Number(t.input_tokens ?? 0) + Number(t.output_tokens ?? 0)
+  return Math.max(0, Math.min(1, total / sessionTokenBudget))
+})
+
+const railUsageTitle = computed(() => {
+  if (!usage.totals) return '用量累计'
+  const u = usage.totals
+  const usd = Number(u.cost_usd ?? 0).toFixed(6)
+  return `USD ${usd} · 输入 ${u.input_tokens ?? 0} / 输出 ${u.output_tokens ?? 0}`
 })
 
 function pushLine(text, kind = 'info') {
@@ -559,12 +574,65 @@ function closeSessionMenuOnOutsideClick(event) {
   const target = event?.target
   if (!(target instanceof Element)) return
   if (target.closest('.recent-menu') || target.closest('.recent-menu-trigger')) return
+  if (target.closest('.settings-hub-popover')) return
   openSessionMenuId.value = null
+  railMenuOpen.value = false
+}
+
+function toggleSettingsHub() {
+  railMenuOpen.value = !railMenuOpen.value
+}
+
+async function onRailSearch() {
+  leftPanelCollapsed.value = false
+  await nextTick()
+  sessionSearchInputRef.value?.focus?.()
+}
+
+function onSkillMarket() {
+  railMenuOpen.value = false
+  pushLine('Skill 市场即将推出，敬请期待。', 'info')
+}
+
+async function onHubLogin() {
+  try {
+    await ensureAuthAndSessions()
+  } finally {
+    railMenuOpen.value = false
+  }
+}
+
+function onHubLogout() {
+  auth.logout()
+  railMenuOpen.value = false
+}
+
+function onHubSystemSettingsPlaceholder() {
+  pushLine('系统设置页即将接入（主题、网络、关于等）。', 'info')
+}
+
+function selectSearchInput(ev) {
+  ev?.target?.select?.()
+}
+
+function onGlobalKeydown(ev) {
+  if (isNarrowScreen.value) return
+  const t = ev.target
+  if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement) return
+  if (ev.ctrlKey && ev.key.toLowerCase() === 'k') {
+    ev.preventDefault()
+    onRailSearch()
+  }
+  if (ev.ctrlKey && ev.key.toLowerCase() === 'n') {
+    ev.preventDefault()
+    if (auth.isAuthed) onNewSession()
+  }
 }
 
 onBeforeUnmount(() => {
   stopDrag()
   window.removeEventListener('resize', onResize)
+  window.removeEventListener('keydown', onGlobalKeydown)
   document.removeEventListener('click', closeSessionMenuOnOutsideClick)
   streamArea.value?.removeEventListener?.('scroll', onStreamScroll)
 })
@@ -573,6 +641,7 @@ onResize()
 window.addEventListener('resize', onResize)
 onMounted(() => {
   document.addEventListener('click', closeSessionMenuOnOutsideClick)
+  window.addEventListener('keydown', onGlobalKeydown)
 })
 watch(
   () => streamArea.value,
@@ -594,78 +663,180 @@ watch(
     <header class="bar">
       <div class="title">Financial-CoAgent · S1</div>
       <div class="actions">
-        <button v-if="!auth.isAuthed" type="button" @click="ensureAuthAndSessions">登录（开发）</button>
-        <button v-else type="button" @click="auth.logout">退出</button>
-        <button type="button" :disabled="!auth.isAuthed" @click="onNewSession">新会话</button>
+        <template v-if="isNarrowScreen">
+          <button v-if="!auth.isAuthed" type="button" @click="ensureAuthAndSessions">登录（开发）</button>
+          <button v-else type="button" @click="auth.logout">退出</button>
+        </template>
         <button type="button" :disabled="!streaming" @click="onStop">中断流</button>
         <button type="button" :disabled="!lastResumeToken || streaming" @click="onResume">从检查点恢复</button>
-        <button type="button" @click="leftCollapsed = !leftCollapsed">{{ leftCollapsed ? '打开左栏' : '收起左栏' }}</button>
         <button type="button" @click="rightCollapsed = !rightCollapsed">{{ rightCollapsed ? '打开右栏' : '收起右栏' }}</button>
         <button v-if="isNarrowScreen && !rightCollapsed" type="button" @click="rightDrawerOpen = !rightDrawerOpen">
           {{ rightDrawerOpen ? '关闭阶段栏' : '打开阶段栏' }}
         </button>
       </div>
-      <div v-if="usage.totals" class="usage">
-        用量累计：USD {{ Number(usage.totals.cost_usd ?? 0).toFixed(6) }} · tokens
-        {{ usage.totals.input_tokens ?? 0 }}/{{ usage.totals.output_tokens ?? 0 }}
-      </div>
     </header>
 
     <div class="main">
-      <aside v-if="!leftCollapsed" class="side" :style="{ width: `${leftWidth}px` }">
-        <div class="brand">Financial-CoAgent</div>
-        <div class="side-tools">
-          <button type="button" class="tool-item" :disabled="!auth.isAuthed" @click="onNewSession">
-            <span class="tool-icon">＋</span>
-            <span>New chat</span>
+      <aside
+        v-if="!isNarrowScreen"
+        class="claude-sidebar"
+        :class="{ collapsed: leftPanelCollapsed }"
+        :style="{ width: leftPanelCollapsed ? `${railWidth}px` : `${leftWidth}px` }"
+      >
+        <div class="sidebar-inner">
+          <header class="sb-top" :class="{ 'sb-top--narrow': leftPanelCollapsed }">
+            <template v-if="!leftPanelCollapsed">
+              <span class="sb-brand">金融协作助手</span>
+              <button type="button" class="sb-panel-toggle" title="收拢为图标栏" @click="leftPanelCollapsed = true">
+                <span class="sb-toggle-glyph sb-toggle-glyph--arrow" aria-hidden="true">&lt;&lt;</span>
+              </button>
+            </template>
+            <button
+              v-else
+              type="button"
+              class="sb-panel-toggle sb-panel-toggle--center"
+              title="展开侧栏"
+              @click="leftPanelCollapsed = false"
+            >
+              <span class="sb-toggle-glyph sb-toggle-glyph--arrow" aria-hidden="true">&gt;&gt;</span>
+            </button>
+          </header>
+
+          <button
+            type="button"
+            class="sb-new-chat"
+            :class="{ 'sb-new-chat--icon': leftPanelCollapsed }"
+            :disabled="!auth.isAuthed"
+            @click="onNewSession"
+          >
+            <span class="sb-new-plus">+</span>
+            <template v-if="!leftPanelCollapsed">
+              <span class="sb-new-label">新建会话</span>
+              <span class="sb-new-kbd">Ctrl+N</span>
+            </template>
           </button>
-          <div class="tool-search">
-            <span class="tool-icon">⌕</span>
-            <input v-model="sessionSearch" class="search-input" placeholder="Search" />
-            <span class="search-hotkey">Ctrl+K</span>
+
+          <nav v-if="!leftPanelCollapsed" class="sb-nav">
+            <div class="sb-search-row">
+              <span class="sb-nav-ico" aria-hidden="true">⌕</span>
+              <input
+                ref="sessionSearchInputRef"
+                v-model="sessionSearch"
+                class="sb-search-input"
+                type="search"
+                placeholder="搜索会话"
+                @keydown.ctrl.k.prevent="selectSearchInput"
+              />
+              <span class="sb-kbd-inline">Ctrl+K</span>
+            </div>
+            <div class="sb-nav-item is-active is-static" role="presentation">
+              <span class="sb-nav-ico" aria-hidden="true">◎</span>
+              <span>对话</span>
+            </div>
+            <button type="button" class="sb-nav-item" @click="onSkillMarket">
+              <span class="sb-nav-ico" aria-hidden="true">◇</span>
+              <span>Skill 市场</span>
+            </button>
+          </nav>
+
+          <nav v-else class="sb-collapsed-icons" aria-label="快捷入口">
+            <button type="button" class="sb-icon-tile" title="搜索" @click="onRailSearch">⌕</button>
+            <button type="button" class="sb-icon-tile" title="Skill 市场" @click="onSkillMarket">◇</button>
+          </nav>
+
+          <div v-if="!leftPanelCollapsed" class="sb-recents-label">最近</div>
+          <div v-show="!leftPanelCollapsed" class="sb-recents-scroll">
+            <div class="recent-list">
+              <div class="recent-group-title">今天</div>
+              <button v-for="s in groupedSessions.today" :key="s.id" type="button" :class="['recent-item', { active: currentId === s.id, 'menu-open': openSessionMenuId === s.id }]" @click="onSelectSession(s.id)">
+                <div class="recent-main">{{ s.pinned ? '📌 ' : '' }}{{ s.title || '未命名会话' }}</div>
+                <button type="button" class="recent-menu-trigger" @click.stop="toggleSessionMenu(s.id)" title="更多">⋯</button>
+                <div v-if="openSessionMenuId === s.id" class="recent-menu">
+                  <button type="button" class="recent-action" @click.stop="onRenameSession(s)">重命名</button>
+                  <button type="button" class="recent-action" @click.stop="onTogglePinSession(s)">{{ s.pinned ? '取消置顶' : '置顶' }}</button>
+                  <button type="button" class="recent-action danger" @click.stop="onDeleteSession(s)">删除</button>
+                </div>
+              </button>
+              <div class="recent-group-title">昨天</div>
+              <button v-for="s in groupedSessions.yesterday" :key="s.id" type="button" :class="['recent-item', { active: currentId === s.id, 'menu-open': openSessionMenuId === s.id }]" @click="onSelectSession(s.id)">
+                <div class="recent-main">{{ s.pinned ? '📌 ' : '' }}{{ s.title || '未命名会话' }}</div>
+                <button type="button" class="recent-menu-trigger" @click.stop="toggleSessionMenu(s.id)" title="更多">⋯</button>
+                <div v-if="openSessionMenuId === s.id" class="recent-menu">
+                  <button type="button" class="recent-action" @click.stop="onRenameSession(s)">重命名</button>
+                  <button type="button" class="recent-action" @click.stop="onTogglePinSession(s)">{{ s.pinned ? '取消置顶' : '置顶' }}</button>
+                  <button type="button" class="recent-action danger" @click.stop="onDeleteSession(s)">删除</button>
+                </div>
+              </button>
+              <div class="recent-group-title">更早</div>
+              <button v-for="s in groupedSessions.older" :key="s.id" type="button" :class="['recent-item', { active: currentId === s.id, 'menu-open': openSessionMenuId === s.id }]" @click="onSelectSession(s.id)">
+                <div class="recent-main">{{ s.pinned ? '📌 ' : '' }}{{ s.title || '未命名会话' }}</div>
+                <button type="button" class="recent-menu-trigger" @click.stop="toggleSessionMenu(s.id)" title="更多">⋯</button>
+                <div v-if="openSessionMenuId === s.id" class="recent-menu">
+                  <button type="button" class="recent-action" @click.stop="onRenameSession(s)">重命名</button>
+                  <button type="button" class="recent-action" @click.stop="onTogglePinSession(s)">{{ s.pinned ? '取消置顶' : '置顶' }}</button>
+                  <button type="button" class="recent-action danger" @click.stop="onDeleteSession(s)">删除</button>
+                </div>
+              </button>
+              <div v-if="!filteredSessions.length" class="recent-empty">暂无会话</div>
+            </div>
+            <p v-if="sessions.error" class="err">{{ sessions.error }}</p>
+          </div>
+
+          <div class="sb-footer-stack">
+            <div
+              v-if="railMenuOpen"
+              class="settings-hub-popover"
+              :class="leftPanelCollapsed ? 'settings-hub-popover--rail' : 'settings-hub-popover--anchor-up'"
+              @click.stop
+            >
+              <section class="hub-section">
+                <div class="hub-section-title">用户信息</div>
+                <p class="hub-section-body">
+                  {{ auth.isAuthed ? '当前为开发登录，后续将对接企业 SSO。' : '未登录，部分功能不可用。' }}
+                </p>
+                <button v-if="!auth.isAuthed" type="button" class="hub-action primary" @click="onHubLogin">登录（开发）</button>
+              </section>
+              <section class="hub-section">
+                <div class="hub-section-title">用量</div>
+                <div class="hub-usage-row" :title="railUsageTitle">
+                  <div class="rail-usage-ring hub-usage-ring" :style="{ '--used': `${globalUsagePercent}` }">
+                    <span>{{ Math.round(globalUsagePercent * 100) }}%</span>
+                  </div>
+                  <div class="hub-usage-copy">
+                    <p v-if="usage.totals" class="hub-usage-lines">
+                      USD {{ Number(usage.totals.cost_usd ?? 0).toFixed(6) }}<br />
+                      输入 {{ usage.totals.input_tokens ?? 0 }} / 输出 {{ usage.totals.output_tokens ?? 0 }}
+                    </p>
+                    <p v-else class="hub-section-muted">尚无累计用量</p>
+                  </div>
+                </div>
+              </section>
+              <section class="hub-section">
+                <div class="hub-section-title">系统设置</div>
+                <p class="hub-section-muted">主题、网络代理、关于与本机选项等将在此集中配置。</p>
+                <button type="button" class="hub-action subtle" @click="onHubSystemSettingsPlaceholder">系统设置（占位）</button>
+              </section>
+              <section v-if="auth.isAuthed" class="hub-section">
+                <button type="button" class="hub-action danger" @click="onHubLogout">退出登录</button>
+              </section>
+              <p class="hub-footer">更多功能（通知、快捷键、插件等）将陆续加入此处。</p>
+            </div>
+            <footer class="sb-footer" :class="{ 'sb-footer--rail': leftPanelCollapsed }" @click.stop>
+              <button type="button" class="sb-footer-user" @click.stop="toggleSettingsHub">
+                <span class="sb-avatar">{{ auth.isAuthed ? '户' : '?' }}</span>
+                <div v-if="!leftPanelCollapsed" class="sb-footer-meta">
+                  <span class="sb-footer-name">{{ auth.isAuthed ? '开发用户' : '未登录' }}</span>
+                  <span class="sb-footer-plan">{{ auth.isAuthed ? '开发模式' : '登录后使用' }}</span>
+                </div>
+              </button>
+              <div v-if="!leftPanelCollapsed" class="sb-footer-actions">
+                <button type="button" class="sb-footer-icon-btn" title="账户与设置" @click.stop="toggleSettingsHub">⌄</button>
+              </div>
+            </footer>
           </div>
         </div>
-        <div class="side-divider" />
-        <div class="recent-title">Recents</div>
-        <div class="recent-list">
-          <div class="recent-group-title">Today</div>
-          <button v-for="s in groupedSessions.today" :key="s.id" type="button" :class="['recent-item', { active: currentId === s.id }]" @click="onSelectSession(s.id)">
-            <div class="recent-main">{{ s.pinned ? '📌 ' : '' }}{{ s.title || '未命名会话' }}</div>
-            <div v-if="isDev" class="recent-sub">{{ s.id.slice(0, 8) }}</div>
-            <button type="button" class="recent-menu-trigger" @click.stop="toggleSessionMenu(s.id)" title="更多">⋯</button>
-            <div v-if="openSessionMenuId === s.id" class="recent-menu">
-              <button type="button" class="recent-action" @click.stop="onRenameSession(s)">重命名</button>
-              <button type="button" class="recent-action" @click.stop="onTogglePinSession(s)">{{ s.pinned ? '取消置顶' : '置顶' }}</button>
-              <button type="button" class="recent-action danger" @click.stop="onDeleteSession(s)">删除</button>
-            </div>
-          </button>
-          <div class="recent-group-title">Yesterday</div>
-          <button v-for="s in groupedSessions.yesterday" :key="s.id" type="button" :class="['recent-item', { active: currentId === s.id }]" @click="onSelectSession(s.id)">
-            <div class="recent-main">{{ s.pinned ? '📌 ' : '' }}{{ s.title || '未命名会话' }}</div>
-            <div v-if="isDev" class="recent-sub">{{ s.id.slice(0, 8) }}</div>
-            <button type="button" class="recent-menu-trigger" @click.stop="toggleSessionMenu(s.id)" title="更多">⋯</button>
-            <div v-if="openSessionMenuId === s.id" class="recent-menu">
-              <button type="button" class="recent-action" @click.stop="onRenameSession(s)">重命名</button>
-              <button type="button" class="recent-action" @click.stop="onTogglePinSession(s)">{{ s.pinned ? '取消置顶' : '置顶' }}</button>
-              <button type="button" class="recent-action danger" @click.stop="onDeleteSession(s)">删除</button>
-            </div>
-          </button>
-          <div class="recent-group-title">Older</div>
-          <button v-for="s in groupedSessions.older" :key="s.id" type="button" :class="['recent-item', { active: currentId === s.id }]" @click="onSelectSession(s.id)">
-            <div class="recent-main">{{ s.pinned ? '📌 ' : '' }}{{ s.title || '未命名会话' }}</div>
-            <div v-if="isDev" class="recent-sub">{{ s.id.slice(0, 8) }}</div>
-            <button type="button" class="recent-menu-trigger" @click.stop="toggleSessionMenu(s.id)" title="更多">⋯</button>
-            <div v-if="openSessionMenuId === s.id" class="recent-menu">
-              <button type="button" class="recent-action" @click.stop="onRenameSession(s)">重命名</button>
-              <button type="button" class="recent-action" @click.stop="onTogglePinSession(s)">{{ s.pinned ? '取消置顶' : '置顶' }}</button>
-              <button type="button" class="recent-action danger" @click.stop="onDeleteSession(s)">删除</button>
-            </div>
-          </button>
-          <div v-if="!filteredSessions.length" class="recent-empty">暂无会话</div>
-        </div>
-        <p v-if="sessions.error" class="err">{{ sessions.error }}</p>
       </aside>
-      <div v-if="!leftCollapsed" class="splitter" @mousedown="startDrag('left', $event)" />
+      <div v-if="!leftPanelCollapsed && !isNarrowScreen" class="splitter" @mousedown="startDrag('left', $event)" />
 
       <section class="chat">
         <div ref="streamArea" class="stream">
@@ -787,45 +958,533 @@ watch(
 .wrap { display: flex; flex-direction: column; height: 100vh; font-family: system-ui, sans-serif; color: #e8eaed; background: #0f1115; }
 .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid #2a2f3a; background: #151821; }
 .title { font-weight: 600; }
-.actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.usage { margin-left: auto; font-size: 12px; opacity: 0.85; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
 .main { display: flex; flex: 1; min-height: 0; }
-.side { border-right: 1px solid #2a2f3a; padding: 10px 10px 12px; font-size: 13px; flex: 0 0 auto; min-width: 180px; max-width: 460px; overflow: auto; background: #11151d; color: #d1d5db; }
-.brand { font-size: 24px; line-height: 1.1; margin: 2px 4px 10px; font-family: system-ui, -apple-system, sans-serif; color: #f3f4f6; font-weight: 700; }
-.side-tools { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
-.tool-item { border: 1px solid transparent; background: transparent; color: #e5e7eb; border-radius: 10px; padding: 8px 10px; text-align: left; cursor: pointer; display: flex; align-items: center; gap: 8px; }
-.tool-item:hover { background: #1a2331; }
-.tool-search { border: 1px solid #2f3642; background: #0f1724; color: #e5e7eb; border-radius: 10px; padding: 8px 10px; display: flex; align-items: center; gap: 8px; }
-.tool-icon { font-size: 14px; opacity: 0.9; min-width: 16px; text-align: center; }
-.search-input { width: 100%; background: transparent; color: #e5e7eb; border: none; outline: none; font-size: 14px; }
-.search-hotkey { font-size: 11px; color: #9ca3af; white-space: nowrap; }
-.side-divider { height: 1px; background: #2a2f3a; margin: 6px 2px 10px; }
-.recent-title { font-size: 12px; color: #9ca3af; margin: 10px 0 8px; }
+.claude-sidebar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-width: 460px;
+  background: #11151d;
+  border-right: 1px solid #2a2f3a;
+  color: #d1d5db;
+  overflow: hidden;
+}
+.claude-sidebar.collapsed {
+  overflow: visible;
+  z-index: 20;
+}
+.sidebar-inner {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  padding: 12px 10px 0;
+}
+.claude-sidebar.collapsed .sidebar-inner {
+  padding: 10px 6px 0;
+}
+.sb-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 0 2px 12px;
+}
+.sb-top--narrow {
+  justify-content: center;
+  padding-bottom: 10px;
+}
+.sb-brand {
+  font-size: 18px;
+  font-weight: 650;
+  color: #f9fafb;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  font-family: Georgia, "Times New Roman", serif;
+}
+.sb-panel-toggle {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid #374151;
+  background: #1a2331;
+  color: #e5e7eb;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.sb-panel-toggle:hover {
+  border-color: #60a5fa;
+  color: #bfdbfe;
+  background: #1e293b;
+}
+.sb-panel-toggle--center {
+  width: 36px;
+  height: 36px;
+}
+.sb-toggle-glyph {
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.9;
+}
+.sb-toggle-glyph--arrow {
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: -0.14em;
+  opacity: 0.92;
+}
+.sb-new-chat {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  border-radius: 10px;
+  border: 1px solid #3f4f60;
+  background: #1a2332;
+  color: #f3f4f6;
+  cursor: pointer;
+  text-align: left;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+.sb-new-chat:hover:not(:disabled) {
+  border-color: #60a5fa;
+  background: #1e293b;
+}
+.sb-new-chat:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.sb-new-chat--icon {
+  width: 40px;
+  height: 40px;
+  justify-content: center;
+  padding: 0;
+  margin-left: auto;
+  margin-right: auto;
+  margin-bottom: 8px;
+  border-radius: 999px;
+}
+.sb-new-plus {
+  font-size: 20px;
+  font-weight: 500;
+  line-height: 1;
+}
+.sb-new-label {
+  flex: 1;
+  font-weight: 500;
+}
+.sb-new-kbd,
+.sb-kbd-inline {
+  font-size: 11px;
+  color: #9ca3af;
+  white-space: nowrap;
+}
+.sb-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+  margin-bottom: 8px;
+}
+.sb-search-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  margin-bottom: 4px;
+  border-radius: 8px;
+  border: 1px solid #2f3642;
+  background: #0f1724;
+}
+.sb-search-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: #e5e7eb;
+  outline: none;
+  font-size: 13px;
+}
+.sb-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: #d1d5db;
+  cursor: pointer;
+  text-align: left;
+  font-size: 13px;
+}
+.sb-nav-item:not(.is-static):hover {
+  background: #1a2331;
+}
+.sb-nav-item.is-active {
+  background: #1e3a5f;
+  color: #e0f2fe;
+}
+.sb-nav-item.is-static {
+  cursor: default;
+  pointer-events: none;
+}
+.sb-nav-ico {
+  width: 20px;
+  text-align: center;
+  font-size: 14px;
+  opacity: 0.88;
+  flex-shrink: 0;
+}
+.sb-collapsed-icons {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-height: 48px;
+  padding: 4px 0 10px;
+}
+.sb-icon-tile {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid #374151;
+  background: #161d2a;
+  color: #e5e7eb;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  line-height: 1;
+}
+.sb-icon-tile:hover {
+  border-color: #60a5fa;
+  color: #bfdbfe;
+  background: #1a2332;
+}
+.sb-icon-tile.is-active {
+  background: #1e3a5f;
+  border-color: #3b82f6;
+  color: #dbeafe;
+}
+.sb-recents-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #9ca3af;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin: 6px 2px 8px;
+  flex-shrink: 0;
+}
+.sb-recents-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 2px;
+  margin-bottom: 8px;
+}
+.sb-footer-stack {
+  position: relative;
+  flex-shrink: 0;
+  margin-top: auto;
+  border-top: 1px solid #2a2f3a;
+  background: #11151d;
+}
+.sb-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 4px 12px;
+}
+.sb-footer--rail {
+  justify-content: center;
+  padding-left: 2px;
+  padding-right: 2px;
+}
+.sb-footer--rail .sb-footer-user {
+  flex: 0 0 auto;
+}
+.sb-footer-user {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.sb-footer-user:hover {
+  background: #1a2331;
+}
+.sb-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  background: #374151;
+  color: #f9fafb;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.sb-footer-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.sb-footer-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: #f3f4f6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sb-footer-plan {
+  font-size: 11px;
+  color: #9ca3af;
+}
+.sb-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.sb-footer-icon-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  line-height: 1;
+}
+.sb-footer-icon-btn:hover {
+  background: #1a2331;
+  color: #e5e7eb;
+}
+.settings-hub-popover {
+  z-index: 140;
+  overflow-y: auto;
+  padding: 12px 14px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  text-align: left;
+}
+.settings-hub-popover--anchor-up {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 100%;
+  margin-bottom: 8px;
+  width: auto;
+  max-height: min(520px, 58vh);
+}
+.settings-hub-popover--rail {
+  position: absolute;
+  left: calc(100% + 8px);
+  right: auto;
+  bottom: 0;
+  width: min(300px, calc(100vw - 72px));
+  min-width: 240px;
+  margin-bottom: 0;
+  max-height: min(520px, 70vh);
+  z-index: 150;
+}
+.hub-section {
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #1e293b;
+}
+.hub-section:last-of-type {
+  border-bottom: none;
+  margin-bottom: 0;
+  padding-bottom: 0;
+}
+.hub-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #e5e7eb;
+  margin-bottom: 8px;
+}
+.hub-section-body {
+  font-size: 12px;
+  color: #cbd5e1;
+  line-height: 1.45;
+  margin: 0 0 10px;
+}
+.hub-section-muted {
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.45;
+  margin: 0 0 10px;
+}
+.hub-action {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid #475569;
+  background: #1e293b;
+  color: #e2e8f0;
+}
+.hub-action.primary {
+  border-color: #2563eb;
+  background: #1d4ed8;
+  color: #eff6ff;
+}
+.hub-action.primary:hover {
+  background: #2563eb;
+}
+.hub-action.subtle:hover {
+  border-color: #60a5fa;
+  color: #bfdbfe;
+}
+.hub-action.danger {
+  border-color: #991b1b;
+  background: #450a0a;
+  color: #fecaca;
+}
+.hub-action.danger:hover {
+  border-color: #f87171;
+  color: #fef2f2;
+}
+.hub-usage-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.hub-usage-copy {
+  flex: 1;
+  min-width: 0;
+}
+.hub-usage-lines {
+  font-size: 11px;
+  color: #94a3b8;
+  line-height: 1.45;
+  margin: 0;
+  word-break: break-all;
+}
+.rail-usage-ring.hub-usage-ring {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+}
+.rail-usage-ring.hub-usage-ring::after {
+  width: 24px;
+  height: 24px;
+}
+.rail-usage-ring.hub-usage-ring span {
+  font-size: 9px;
+}
+.hub-footer {
+  font-size: 11px;
+  color: #64748b;
+  line-height: 1.45;
+  margin: 12px 0 0;
+  padding-top: 10px;
+  border-top: 1px dashed #334155;
+}
+.rail-usage-ring {
+  --used: 0;
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  background: conic-gradient(#60a5fa calc(var(--used) * 360deg), #374151 0deg);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+.rail-usage-ring::after {
+  content: '';
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: #0c0f14;
+}
+.rail-usage-ring span {
+  position: relative;
+  z-index: 1;
+  font-size: 8px;
+  color: #cbd5e1;
+  font-weight: 600;
+}
 .recent-list { display: flex; flex-direction: column; gap: 6px; }
 .recent-group-title { font-size: 11px; color: #94a3b8; margin: 8px 0 2px; }
-.recent-item { border: 1px solid transparent; background: transparent; color: #d1d5db; border-radius: 8px; padding: 8px; text-align: left; cursor: pointer; }
-.recent-item { position: relative; }
+.recent-item {
+  border: 1px solid transparent;
+  background: transparent;
+  color: #d1d5db;
+  border-radius: 8px;
+  padding: 8px 30px 8px 8px;
+  text-align: left;
+  cursor: pointer;
+  position: relative;
+}
+.recent-item.menu-open {
+  z-index: 50;
+}
 .recent-item:hover { background: #1a2331; }
+.recent-item:focus-within:not(.active) {
+  background: #1a2331;
+  border-color: #334155;
+}
 .recent-item.active { background: #1d4ed8; border-color: #2563eb; color: #eff6ff; }
-.recent-main { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.recent-sub { font-size: 11px; color: #94a3b8; margin-top: 2px; }
+.recent-item.active:focus-within {
+  border-color: #93c5fd;
+}
+.recent-main { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 2px; }
 .recent-actions { display: flex; gap: 4px; margin-top: 6px; }
 .recent-action { border: 1px solid #334155; background: transparent; color: #cbd5e1; border-radius: 999px; font-size: 10px; padding: 1px 6px; }
 .recent-action.danger { color: #fca5a5; border-color: #7f1d1d; }
 .recent-menu-trigger {
   position: absolute;
-  top: 8px;
-  right: 8px;
-  width: 20px;
-  height: 20px;
+  top: 6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
   padding: 0;
   border-radius: 6px;
-  border: none;
-  background: transparent;
+  border: 1px solid transparent;
+  background: #11151d;
   color: #94a3b8;
   font-size: 13px;
   font-weight: 700;
-  line-height: 20px;
+  line-height: 1;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -833,6 +1492,8 @@ watch(
   font-family: "Segoe UI", sans-serif;
   opacity: 0;
   pointer-events: none;
+  z-index: 2;
+  box-sizing: border-box;
 }
 .recent-item:hover .recent-menu-trigger,
 .recent-item.active .recent-menu-trigger,
@@ -841,14 +1502,35 @@ watch(
   pointer-events: auto;
 }
 .recent-menu-trigger:hover {
-  background: #1f2937;
+  background: #1e293b;
+  border-color: #475569;
   color: #e2e8f0;
+}
+.recent-menu-trigger:focus-visible {
+  outline: none;
+  background: #0f172a;
+  border-color: #60a5fa;
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.5);
+  color: #e2e8f0;
+}
+.recent-item.active .recent-menu-trigger {
+  background: rgba(15, 23, 42, 0.35);
+  color: #e0e7ff;
+}
+.recent-item.active .recent-menu-trigger:hover {
+  background: rgba(15, 23, 42, 0.55);
+  border-color: #93c5fd;
+}
+.recent-item.active .recent-menu-trigger:focus-visible {
+  background: rgba(15, 23, 42, 0.65);
+  border-color: #bfdbfe;
+  box-shadow: 0 0 0 1px rgba(191, 219, 254, 0.65);
 }
 .recent-menu {
   position: absolute;
   top: 30px;
   right: 8px;
-  z-index: 5;
+  z-index: 51;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -856,6 +1538,7 @@ watch(
   border: 1px solid #334155;
   border-radius: 8px;
   background: #0f172a;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
 }
 .recent-empty { font-size: 12px; color: #6b7280; padding: 6px 2px; }
 .chat { display: flex; flex-direction: column; min-width: 0; flex: 1; position: relative; }
@@ -981,18 +1664,18 @@ watch(
 
 .stream::-webkit-scrollbar,
 .stage-panel::-webkit-scrollbar,
-.side::-webkit-scrollbar {
+.claude-sidebar .sb-recents-scroll::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 .stream::-webkit-scrollbar-track,
 .stage-panel::-webkit-scrollbar-track,
-.side::-webkit-scrollbar-track {
+.claude-sidebar .sb-recents-scroll::-webkit-scrollbar-track {
   background: transparent;
 }
 .stream::-webkit-scrollbar-thumb,
 .stage-panel::-webkit-scrollbar-thumb,
-.side::-webkit-scrollbar-thumb {
+.claude-sidebar .sb-recents-scroll::-webkit-scrollbar-thumb {
   background: #374151;
   border-radius: 999px;
   border: 2px solid transparent;
@@ -1000,13 +1683,15 @@ watch(
 }
 .stream::-webkit-scrollbar-thumb:hover,
 .stage-panel::-webkit-scrollbar-thumb:hover,
-.side::-webkit-scrollbar-thumb:hover {
+.claude-sidebar .sb-recents-scroll::-webkit-scrollbar-thumb:hover {
   background: #4b5563;
   background-clip: content-box;
 }
 
 @media (max-width: 1280px) {
-  .side { width: 220px !important; }
+  .claude-sidebar:not(.collapsed) {
+    width: 220px !important;
+  }
   .stage-panel { width: 280px !important; }
 }
 
@@ -1035,7 +1720,7 @@ watch(
 }
 
 @media (max-width: 768px) {
-  .side { display: none; }
+  .claude-sidebar { display: none; }
   .splitter:first-of-type { display: none; }
   .bubble { max-width: 92%; }
 }
