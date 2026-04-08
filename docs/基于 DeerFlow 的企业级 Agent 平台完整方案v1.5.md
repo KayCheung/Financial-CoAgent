@@ -860,6 +860,8 @@ class GlobalToolLockRegistry:
         ))
 
         try:
+            backoff = 0.02       # 20ms 起步
+            max_backoff = 0.50   # 最高 500ms
             while time.time() < deadline:
                 acquired = await self._acquire_redis_slot(
                     tool_name=tool_name,
@@ -888,7 +890,9 @@ class GlobalToolLockRegistry:
                         registry=self,
                     )
 
-                await asyncio.sleep(0.05)
+                # 指数退避 + 抖动，降低高并发下 Redis 热点与惊群效应
+                await asyncio.sleep(backoff * random.uniform(0.8, 1.2))
+                backoff = min(backoff * 1.6, max_backoff)
 
             raise ResourceContentionException(
                 f"工具 [{tool_name}] 等待超时 ({timeout}s)，"
@@ -1640,7 +1644,8 @@ class HITLApprovalStateMachine:
 
         async def _poll_decision() -> ApprovalStatus:
             # 轮询持久态：Pod 重启后可继续等待，不依赖内存 Event
-            interval = 2.0
+            interval = 0.5 if record.risk_level == "urgent" else 2.0
+            max_interval = 5.0 if record.risk_level == "urgent" else 15.0
             async with self._poll_sem:
                 while True:
                     updated = await self._pg.get_approval(approval_id)
@@ -1651,7 +1656,7 @@ class HITLApprovalStateMachine:
                     ):
                         return updated.status
                     await asyncio.sleep(interval * random.uniform(0.9, 1.1))
-                    interval = min(interval * 1.5, 15.0)
+                    interval = min(interval * 1.5, max_interval)
 
         remind_task = asyncio.create_task(_remind_task())
 
@@ -2761,19 +2766,26 @@ observability:
 
 ### 13.1 优先行动项（第一个月必须完成）
 
+#### 13.1.1 工程可交付验收（阻塞上线）
+
 | # | 行动项 | 负责角色 | 验收标准 |
 |---|---|---|---|
-| 1 | Token Budget Guard 接入所有 Agent | Harness Engineer | 单 Thread 成本可量化，超预算自动告警 |
-| 2 | Planner 重试上限硬编码（≤2次）+ 错误上下文携带 | Harness Engineer | Planner 最大 LLM 调用次数 ≤ 3 |
-| 3 | SR 冷启动阈值下调至 0.75 + 抽样率提升至 20% | AI 算法 | 冷启动期 LLM 调用次数 < 稳定期 2x |
-| 4 | Scratchpad L1 分片存储（64KB/片）+ 滚动压缩 | Harness Engineer | 超长推理链 Redis 内存占用 < 50MB |
-| 5 | 全局工具锁注册表上线（max wait 30s） | 平台架构师 | 无静默挂起，超时返回 RESOURCE_CONTENTION |
-| 6 | 财务报销自动闭环率考核 | 业务/产品架构师 | 财务报销 Agent 在非受控真实发票环境中的无人工接管（全自动闭环率）达到 **85%** |
-| 7 | 法务合同审查效率核算 | 业务/产品架构师 | 法务合同审查人工耗时（含 OCR 机读比对与重点风险定位）相较纯人工方式 **下降 60%** |
-| 8 | 知识库客服 Agent 自主结单率 | 业务/产品架构师 | 在对客支持及机构 SOP 检索场景下，系统给出有效行动并无需转接人工核查的自动化结单率持平或超过 **90%** |
-| 9 | 合规初筛（审计）虚假上报缩减率 | 财务风控委员会 | Q3/Q4 自动化财报与单据审计批次中，Agent 暴露的虚假召回（无风险却报异常）占比相比纯规则引擎模式收敛至 **5% 以内** |
+| E1 | Token Budget Guard 接入所有 Agent | Harness Engineer | 单 Thread 成本可量化，超预算自动告警 |
+| E2 | Planner 重试上限硬编码（≤2次）+ 错误上下文携带 | Harness Engineer | Planner 最大 LLM 调用次数 ≤ 3 |
+| E3 | SR 冷启动阈值下调至 0.75 + 抽样率提升至 20% | AI 算法 | 冷启动期 LLM 调用次数 < 稳定期 2x |
+| E4 | Scratchpad L1 分片存储（64KB/片）+ 滚动压缩 | Harness Engineer | 超长推理链 Redis 内存占用 < 50MB |
+| E5 | 全局工具锁注册表上线（max wait 30s） | 平台架构师 | 无静默挂起，超时返回 RESOURCE_CONTENTION |
 
-> **业务价值导向说明**：以上 Roadmap 摒弃了纯组件上线即验收的工程自嗨。管理层不为中间件买单，只为业务效率增量买单。平台侧里程碑必须以机器自动化闭环率或人工耗时骤降 (SOW Reduction)作为最终验收标尺。
+#### 13.1.2 业务价值验收（并行跟踪，不阻塞平台上线）
+
+| # | 行动项 | 负责角色 | 验收标准 |
+|---|---|---|---|
+| B1 | 财务报销自动闭环率考核 | 业务/产品架构师 | 财务报销 Agent 在非受控真实发票环境中的无人工接管（全自动闭环率）达到 **85%** |
+| B2 | 法务合同审查效率核算 | 业务/产品架构师 | 法务合同审查人工耗时（含 OCR 机读比对与重点风险定位）相较纯人工方式 **下降 60%** |
+| B3 | 知识库客服 Agent 自主结单率 | 业务/产品架构师 | 在对客支持及机构 SOP 检索场景下，系统给出有效行动并无需转接人工核查的自动化结单率持平或超过 **90%** |
+| B4 | 合规初筛（审计）虚假上报缩减率 | 财务风控委员会 | Q3/Q4 自动化财报与单据审计批次中，Agent 暴露的虚假召回（无风险却报异常）占比相比纯规则引擎模式收敛至 **5% 以内** |
+
+> **业务价值导向说明**：Roadmap 以业务价值为最终标尺。首月工程验收用于“保证平台可安全上线”，业务指标按观察窗口并行跟踪，避免冷启动期样本偏差导致工程节奏失真。
 
 ### 13.2 完整实施时间轴（10 个月）
 
@@ -2815,6 +2827,7 @@ M9-M10  生产就绪
   ├─ 蓝红对抗演练（Prompt Injection + 越权测试）
   ├─ 第三方安全审计
   ├─ SR 进入稳定运行区间，切换到常态配置（全局请求数 + 稳定度双条件）
+  ├─ DeerFlow 适配层（Anti-Corruption Layer）设计评审与 POC（远期，不阻塞上线）
   ├─ 强沙箱只对高风险代码执行场景灰度启用
   └─ 全面投产
 ```
