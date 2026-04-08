@@ -255,13 +255,42 @@ class TokenBudgetGuard:
     DEGRADATION_THRESHOLD = 0.70   # 70% 消耗触发成本保护：仅在能力兼容前提下收缩任务
     HARD_LIMIT_THRESHOLD  = 0.95   # 95% 消耗触发硬熔断
 
-    def __init__(self, budget: TokenBudget, metrics_reporter, audit_logger):
+    # Redis Lua：幂等计费（同一个 operation_id 只累计一次）
+    _CONSUME_LUA = """
+    local counter_key = KEYS[1]
+    local op_set_key  = KEYS[2]
+    local op_id       = ARGV[1]
+    local tokens      = tonumber(ARGV[2])
+    local ttl_secs    = tonumber(ARGV[3])
+
+    if redis.call('SISMEMBER', op_set_key, op_id) == 1 then
+        return tonumber(redis.call('GET', counter_key) or '0')
+    end
+
+    redis.call('SADD', op_set_key, op_id)
+    redis.call('EXPIRE', op_set_key, ttl_secs)
+    local total = redis.call('INCRBY', counter_key, tokens)
+    redis.call('EXPIRE', counter_key, ttl_secs)
+    return total
+    """
+
+    def __init__(self, budget: TokenBudget, metrics_reporter, audit_logger, redis_client):
         self._budget = budget
         self._metrics = metrics_reporter
         self._audit = audit_logger
+        self._redis = redis_client
         self._lock = asyncio.Lock()
+        self._counter_key = f"token_budget:{budget.tenant_id}:{budget.thread_id}:consumed"
+        self._op_set_key = f"token_budget:{budget.tenant_id}:{budget.thread_id}:ops"
+        self._ttl_secs = 86400
 
-    async def consume(self, tokens: int, tier: TokenTier, operation: str) -> None:
+    async def consume(
+        self,
+        tokens: int,
+        tier: TokenTier,
+        operation: str,
+        operation_id: Optional[str] = None,
+    ) -> None:
         """
         消耗 Token 并检查阈值。
         Tier A（规则引擎）直接跳过，零消耗。
@@ -269,39 +298,62 @@ class TokenBudgetGuard:
         if tier == TokenTier.TIER_A:
             return  # 规则引擎零消耗，直接放行
 
-        async with self._lock:
-            self._budget.consumed += tokens
-            ratio = self._budget.usage_ratio
-
-            # 异步上报指标（不阻塞主链路）
-            asyncio.create_task(self._metrics.record(
-                thread_id=self._budget.thread_id,
-                tenant_id=self._budget.tenant_id,
-                consumed=tokens,
-                total_consumed=self._budget.consumed,
-                operation=operation,
-                tier=tier.value,
+        # 全局累加（多 Pod 一致）；若 Redis 不可用，降级到进程内计数并打告警
+        try:
+            if operation_id:
+                global_total = await self._redis.eval(
+                    self._CONSUME_LUA,
+                    2,
+                    self._counter_key,
+                    self._op_set_key,
+                    operation_id,
+                    tokens,
+                    self._ttl_secs,
+                )
+            else:
+                # 未提供 operation_id 时走普通累计，避免生成大规模幂等索引
+                global_total = await self._redis.incrby(self._counter_key, tokens)
+                await self._redis.expire(self._counter_key, self._ttl_secs)
+            self._budget.consumed = int(global_total)
+        except Exception:
+            async with self._lock:
+                self._budget.consumed += tokens
+            asyncio.create_task(self._audit.warn(
+                f"[Budget] Redis 全局计数不可用，已降级本地计数（仅临时容错）: thread={self._budget.thread_id}"
             ))
 
-            # 70% 触发成本保护告警
-            if ratio >= self.DEGRADATION_THRESHOLD and not self._budget.degraded:
-                self._budget.degraded = True
-                self._budget.degraded_at = self._budget.consumed
-                asyncio.create_task(self._audit.warn(
-                    f"[Budget] Thread {self._budget.thread_id} 已消耗 {ratio:.0%}，"
-                    f"触发成本保护: 优先缩小任务范围 / 降低并发 / 仅在能力兼容时切换模型"
-                ))
+        ratio = self._budget.usage_ratio
 
-            # 95% 触发硬熔断
-            if ratio >= self.HARD_LIMIT_THRESHOLD:
-                asyncio.create_task(self._audit.error(
-                    f"[Budget] Thread {self._budget.thread_id} 超预算，强制熔断。"
-                    f"已消耗: {self._budget.consumed}/{self._budget.total_budget}"
-                ))
-                raise TokenBudgetExhaustedException(
-                    f"Token 预算耗尽: {self._budget.consumed}/{self._budget.total_budget}。"
-                    f"任务 {self._budget.thread_id} 已终止。"
-                )
+        # 异步上报指标（不阻塞主链路）
+        asyncio.create_task(self._metrics.record(
+            thread_id=self._budget.thread_id,
+            tenant_id=self._budget.tenant_id,
+            consumed=tokens,
+            total_consumed=self._budget.consumed,
+            operation=operation,
+            operation_id=operation_id or "",
+            tier=tier.value,
+        ))
+
+        # 70% 触发成本保护告警
+        if ratio >= self.DEGRADATION_THRESHOLD and not self._budget.degraded:
+            self._budget.degraded = True
+            self._budget.degraded_at = self._budget.consumed
+            asyncio.create_task(self._audit.warn(
+                f"[Budget] Thread {self._budget.thread_id} 已消耗 {ratio:.0%}，"
+                f"触发成本保护: 优先缩小任务范围 / 降低并发 / 仅在能力兼容时切换模型"
+            ))
+
+        # 95% 触发硬熔断
+        if ratio >= self.HARD_LIMIT_THRESHOLD:
+            asyncio.create_task(self._audit.error(
+                f"[Budget] Thread {self._budget.thread_id} 超预算，强制熔断。"
+                f"已消耗: {self._budget.consumed}/{self._budget.total_budget}"
+            ))
+            raise TokenBudgetExhaustedException(
+                f"Token 预算耗尽: {self._budget.consumed}/{self._budget.total_budget}。"
+                f"任务 {self._budget.thread_id} 已终止。"
+            )
 
     def should_degrade(self) -> bool:
         """供 Planner/Executor 查询：当前是否应降级到轻量模型"""
@@ -437,10 +489,6 @@ class HarnessScratchpad:
         self._shard_keys: List[str] = []    # Redis Key 索引
 
     async def write(self, step: str, content: str) -> None:
-        self._step_count += 1
-        step_idx = self._step_count
-        shard_key = f"scratchpad:{self.thread_id}:step:{step_idx}"
-
         # ── 1. 安全扫描（同步，必须先于写入）──
         security_report = self._rule_engine.scan(content)
 
@@ -448,7 +496,28 @@ class HarnessScratchpad:
         if security_report.is_high_risk:
             self._force_full_audit = True
 
-        # ── 3. 构建分片 ──
+        # ── 3. 违规优先处理：先留审计证据，再熔断，不写 Redis L1 ──
+        if security_report.has_violations:
+            await self._audit_queue.put({
+                "thread_id": self.thread_id,
+                "shard_id": None,
+                "step": step,
+                "content": content,   # 违规场景必须留全量证据
+                "is_violation": True,
+                "audit_reason": "violation_blocked_before_l1",
+                "violations": security_report.violations,
+                "ts": time.time(),
+            })
+            raise HarnessSecurityException(
+                f"Agent 推理越界熔断: {security_report.violations}"
+            )
+
+        # ── 4. 通过校验后再分配 step_idx，避免违规路径污染序号 ──
+        self._step_count += 1
+        step_idx = self._step_count
+        shard_key = f"scratchpad:{self.thread_id}:step:{step_idx}"
+
+        # ── 5. 构建分片 ──
         shard = ScratchpadShard(
             shard_id=shard_key,
             step=step,
@@ -459,7 +528,7 @@ class HarnessScratchpad:
             is_full_audit=self._force_full_audit,
         )
 
-        # ── 4. 写入 Redis L1（分片存储，TTL = 会话生命周期）──
+        # ── 6. 写入 Redis L1（分片存储，TTL = 会话生命周期）──
         shard_data = json.dumps({
             "step": shard.step,
             "content": shard.content,
@@ -477,15 +546,14 @@ class HarnessScratchpad:
         await self._redis.setex(shard_key, 86400, shard_data)  # TTL 24h
         self._shard_keys.append(shard_key)
 
-        # ── 5. 滚动压缩：超过阈值，压缩旧分片 ──
+        # ── 7. 滚动压缩：超过阈值，压缩旧分片 ──
         if step_idx > ROLLING_COMPRESS_AT:
             await self._rolling_compress(step_idx)
 
-        # ── 6. 合规轨落库（独立异步队列，不阻塞推理）──
+        # ── 8. 合规轨落库（独立异步队列，不阻塞推理）──
         should_audit = (
             self._force_full_audit
             or self._is_decision_fingerprint(content)
-            or security_report.has_violations
         )
         if should_audit:
             await self._audit_queue.put({
@@ -498,12 +566,6 @@ class HarnessScratchpad:
                 "audit_reason": "full_mode" if self._force_full_audit else "fingerprint",
                 "ts": shard.timestamp,
             })
-
-        # ── 7. 越权实时熔断（有违规立即抛出）──
-        if security_report.has_violations:
-            raise HarnessSecurityException(
-                f"Agent 推理越界熔断: {security_report.violations}"
-            )
 
     async def _rolling_compress(self, current_step: int) -> None:
         """
@@ -612,26 +674,24 @@ async def audit_queue_consumer(audit_queue: asyncio.Queue, ch_client):
 
 ```python
 import asyncio
+import random
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 @dataclass
 class ToolLockEntry:
-    """工具锁槽位"""
+    """工具锁槽位（配置 + 本地观测镜像）"""
     tool_name: str
     max_concurrency: int    # 该工具允许的最大并发持有数
     current_holders: int = 0
     waiters: int = 0
-    lock: asyncio.Semaphore = field(init=False)
-
-    def __post_init__(self):
-        self.lock = asyncio.Semaphore(self.max_concurrency)
 
 class GlobalToolLockRegistry:
     """
-    全局工具锁注册表（Redis 辅助 + 本地 Semaphore 双保险）
-    解决: 多租户并发下的跨线程资源死锁
+    全局工具锁注册表（Redis 分布式信号量 + 本地观测镜像）
+    解决: 多 Pod 部署下并发上限失真问题
     """
 
     # 工具并发配置（从 Nacos 热加载）
@@ -649,6 +709,61 @@ class GlobalToolLockRegistry:
         self._metrics = metrics_reporter
         self._init_registry()
 
+    # Redis Lua: 原子申请槽位（ZSET 记录持有者，自动剔除过期 holder）
+    _ACQUIRE_LUA = """
+    local holders_key = KEYS[1]
+    local holder_key  = KEYS[2]
+    local max_conc    = tonumber(ARGV[1])
+    local lease_ms    = tonumber(ARGV[2])
+    local now_ms      = tonumber(ARGV[3])
+    local holder_id   = ARGV[4]
+
+    -- 清理过期 holder，避免配额泄漏
+    redis.call('ZREMRANGEBYSCORE', holders_key, '-inf', now_ms)
+
+    if redis.call('EXISTS', holder_key) == 1 then
+        redis.call('PEXPIRE', holder_key, lease_ms)
+        redis.call('ZADD', holders_key, now_ms + lease_ms, holder_id)
+        return 1
+    end
+
+    local current = tonumber(redis.call('ZCARD', holders_key) or '0')
+    if current >= max_conc then
+        return 0
+    end
+
+    redis.call('PSETEX', holder_key, lease_ms, '1')
+    redis.call('ZADD', holders_key, now_ms + lease_ms, holder_id)
+    return 1
+    """
+
+    # Redis Lua: 原子续租（长任务防止 lease 过期）
+    _RENEW_LUA = """
+    local holders_key = KEYS[1]
+    local holder_key  = KEYS[2]
+    local lease_ms    = tonumber(ARGV[1])
+    local now_ms      = tonumber(ARGV[2])
+    local holder_id   = ARGV[3]
+
+    if redis.call('EXISTS', holder_key) == 1 then
+        redis.call('PEXPIRE', holder_key, lease_ms)
+        redis.call('ZADD', holders_key, now_ms + lease_ms, holder_id)
+        return 1
+    end
+    return 0
+    """
+
+    # Redis Lua: 原子释放一个并发槽位
+    _RELEASE_LUA = """
+    local holders_key = KEYS[1]
+    local holder_key  = KEYS[2]
+    local holder_id   = ARGV[1]
+
+    redis.call('DEL', holder_key)
+    redis.call('ZREM', holders_key, holder_id)
+    return 1
+    """
+
     def _init_registry(self):
         for tool_name, max_conc in self.DEFAULT_CONCURRENCY.items():
             self._registry[tool_name] = ToolLockEntry(
@@ -660,19 +775,81 @@ class GlobalToolLockRegistry:
         """获取工具锁条目，未注册的工具使用默认配置"""
         return self._registry.get(tool_name, self._registry["*"])
 
+    def _holders_key(self, tool_name: str) -> str:
+        return f"tool_lock:{tool_name}:holders"
+
+    def _holder_key(self, tool_name: str, holder_id: str) -> str:
+        return f"tool_lock:{tool_name}:holder:{holder_id}"
+
+    async def _acquire_redis_slot(
+        self,
+        tool_name: str,
+        holder_id: str,
+        holder_key: str,
+        max_concurrency: int,
+        lease_ms: int,
+    ) -> bool:
+        now_ms = int(time.time() * 1000)
+        result = await self._redis.eval(
+            self._ACQUIRE_LUA,
+            2,
+            self._holders_key(tool_name),
+            holder_key,
+            max_concurrency,
+            lease_ms,
+            now_ms,
+            holder_id,
+        )
+        return int(result) == 1
+
+    async def _renew_redis_slot(self, tool_name: str, holder_id: str, holder_key: str, lease_ms: int) -> bool:
+        now_ms = int(time.time() * 1000)
+        result = await self._redis.eval(
+            self._RENEW_LUA,
+            2,
+            self._holders_key(tool_name),
+            holder_key,
+            lease_ms,
+            now_ms,
+            holder_id,
+        )
+        return int(result) == 1
+
+    async def _release_redis_slot(self, tool_name: str, holder_id: str, holder_key: str) -> None:
+        await self._redis.eval(
+            self._RELEASE_LUA,
+            2,
+            self._holders_key(tool_name),
+            holder_key,
+            holder_id,
+        )
+
+    async def reconcile_expired(self, tool_name: str) -> None:
+        """
+        后台 Janitor 可周期调用，主动清理过期 holder（无新请求时也能回收配额）。
+        """
+        now_ms = int(time.time() * 1000)
+        await self._redis.zremrangebyscore(self._holders_key(tool_name), "-inf", now_ms)
+
     async def acquire(
         self,
         tool_name: str,
         thread_id: str,
         timeout: float = 30.0,
+        lease_ms: int = 60000,
     ) -> "ToolLockContext":
         """
         申请工具执行槽位。
         - 等待超时: 30s，超时后抛出 RESOURCE_CONTENTION 错误（进入 Critic 重试）
         - 不静默挂起，保证 SLA 可测量
+        - 生产建议增加后台续租任务，避免超长执行导致 holder 过期
         """
         entry = self._get_entry(tool_name)
         entry.waiters += 1
+        waiter_registered = True
+        holder_id = f"{thread_id}:{uuid.uuid4().hex}"
+        holder_key = self._holder_key(tool_name, holder_id)
+        deadline = time.time() + timeout
 
         # 上报等待状态
         asyncio.create_task(self._metrics.record(
@@ -683,34 +860,55 @@ class GlobalToolLockRegistry:
         ))
 
         try:
-            acquired = await asyncio.wait_for(entry.lock.acquire(), timeout=timeout)
-        except asyncio.TimeoutError:
-            entry.waiters -= 1
+            while time.time() < deadline:
+                acquired = await self._acquire_redis_slot(
+                    tool_name=tool_name,
+                    holder_id=holder_id,
+                    holder_key=holder_key,
+                    max_concurrency=entry.max_concurrency,
+                    lease_ms=lease_ms,
+                )
+                if acquired:
+                    entry.waiters = max(0, entry.waiters - 1)
+                    waiter_registered = False
+                    entry.current_holders += 1
+
+                    asyncio.create_task(self._metrics.record(
+                        "tool_lock_acquired",
+                        tool=tool_name,
+                        thread_id=thread_id,
+                        current_holders=entry.current_holders,
+                    ))
+                    return ToolLockContext(
+                        entry=entry,
+                        tool_name=tool_name,
+                        holder_id=holder_id,
+                        holder_key=holder_key,
+                        lease_ms=lease_ms,
+                        registry=self,
+                    )
+
+                await asyncio.sleep(0.05)
+
             raise ResourceContentionException(
                 f"工具 [{tool_name}] 等待超时 ({timeout}s)，"
                 f"当前排队: {entry.waiters}，并发上限: {entry.max_concurrency}。"
                 f"错误类型: RESOURCE_CONTENTION，可触发 Critic 重试。"
             )
+        finally:
+            if waiter_registered:
+                entry.waiters = max(0, entry.waiters - 1)
 
-        entry.waiters -= 1
-        entry.current_holders += 1
+    async def renew(self, tool_name: str, holder_id: str, holder_key: str, lease_ms: int) -> bool:
+        return await self._renew_redis_slot(tool_name, holder_id, holder_key, lease_ms)
 
-        asyncio.create_task(self._metrics.record(
-            "tool_lock_acquired",
-            tool=tool_name,
-            thread_id=thread_id,
-            current_holders=entry.current_holders,
-        ))
-
-        return ToolLockContext(entry=entry, tool_name=tool_name, registry=self)
-
-    async def release(self, tool_name: str) -> None:
+    async def release(self, tool_name: str, holder_id: str, holder_key: str) -> None:
         entry = self._get_entry(tool_name)
         entry.current_holders = max(0, entry.current_holders - 1)
-        entry.lock.release()
+        await self._release_redis_slot(tool_name, holder_id, holder_key)
 
     def update_concurrency(self, tool_name: str, new_max: int) -> None:
-        """Nacos 热更新并发配置（不重建 Semaphore，调整计数器）"""
+        """Nacos 热更新并发配置（分布式配额立即生效）"""
         if tool_name in self._registry:
             self._registry[tool_name].max_concurrency = new_max
 
@@ -718,16 +916,52 @@ class GlobalToolLockRegistry:
 class ToolLockContext:
     """工具锁上下文管理器，支持 async with"""
 
-    def __init__(self, entry: ToolLockEntry, tool_name: str, registry: GlobalToolLockRegistry):
+    def __init__(
+        self,
+        entry: ToolLockEntry,
+        tool_name: str,
+        holder_id: str,
+        holder_key: str,
+        lease_ms: int,
+        registry: GlobalToolLockRegistry,
+    ):
         self._entry = entry
         self._tool_name = tool_name
+        self._holder_id = holder_id
+        self._holder_key = holder_key
+        self._lease_ms = lease_ms
         self._registry = registry
+        self._stop = asyncio.Event()
+        self._heartbeat_task: Optional[asyncio.Task] = None
+
+    async def _heartbeat(self):
+        """续租心跳：避免长任务 lease 过期导致并发超发。"""
+        base = max(1.0, self._lease_ms / 3000)
+        while not self._stop.is_set():
+            await asyncio.sleep(base * random.uniform(0.9, 1.1))
+            renewed = await self._registry.renew(
+                self._tool_name,
+                self._holder_id,
+                self._holder_key,
+                self._lease_ms,
+            )
+            if not renewed:
+                await self._registry._metrics.record(
+                    "tool_lock_lease_lost",
+                    tool=self._tool_name,
+                    holder=self._holder_id,
+                )
+                break
 
     async def __aenter__(self):
+        self._heartbeat_task = asyncio.create_task(self._heartbeat())
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self._registry.release(self._tool_name)
+        self._stop.set()
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+        await self._registry.release(self._tool_name, self._holder_id, self._holder_key)
 
 
 # ── 使用示例（在 Executor 中）──
@@ -1282,6 +1516,7 @@ SET app.current_user   = 'u_12345';
 
 ```python
 import asyncio
+import random
 import uuid
 import time
 from dataclasses import dataclass, field
@@ -1346,7 +1581,19 @@ class HITLApprovalStateMachine:
         self._im = im_client
         self._audit = audit_logger
         self._compensator = resource_compensator
-        self._pending: dict[str, asyncio.Event] = {}  # approval_id → 等待 Event
+        self._poll_sem = asyncio.Semaphore(200)   # 单 Pod 轮询并发上限，避免压垮 PG
+        # 不使用进程内 asyncio.Event，审批等待统一基于 PG 持久态，支持跨 Pod/重启恢复
+
+    async def recover_pending_on_startup(self) -> None:
+        """
+        进程启动恢复：扫描 PENDING 审批并写审计标记，确保重启后可持续追踪。
+        """
+        pending = await self._pg.list_approvals_by_status(ApprovalStatus.PENDING, limit=5000)
+        await self._audit.log({
+            "type": "HITL_RECOVER_PENDING",
+            "count": len(pending),
+            "ts": time.time(),
+        })
 
     async def submit(self, record: ApprovalRecord) -> str:
         """
@@ -1369,25 +1616,19 @@ class HITLApprovalStateMachine:
             risk_level=record.risk_level,
             timeout_hint=f"{record.timeout_seconds // 3600}h",
         )
-
-        # 注册等待 Event
-        self._pending[record.approval_id] = asyncio.Event()
         return record.approval_id
 
     async def wait_for_decision(self, approval_id: str, record: ApprovalRecord) -> bool:
         """
         等待审批决策，含提前催办 + 超时有感知否决。
         """
-        event = self._pending.get(approval_id)
-        if not event:
-            raise HITLException(f"审批 {approval_id} 未找到等待 Event")
-
         timeout = record.timeout_seconds
         remind_at = timeout * 0.75   # 75% 时发送催办（例: 24h 审批在 18h 时催办）
 
         async def _remind_task():
             await asyncio.sleep(remind_at)
-            if not event.is_set():
+            latest = await self._pg.get_approval(approval_id)
+            if latest.status == ApprovalStatus.PENDING:
                 await self._im.send_reminder(
                     to=record.approver_id,
                     approval_id=approval_id,
@@ -1397,22 +1638,46 @@ class HITLApprovalStateMachine:
                     ),
                 )
 
+        async def _poll_decision() -> ApprovalStatus:
+            # 轮询持久态：Pod 重启后可继续等待，不依赖内存 Event
+            interval = 2.0
+            async with self._poll_sem:
+                while True:
+                    updated = await self._pg.get_approval(approval_id)
+                    if updated.status in (
+                        ApprovalStatus.APPROVED,
+                        ApprovalStatus.REJECTED,
+                        ApprovalStatus.TIMEOUT_VETO,
+                    ):
+                        return updated.status
+                    await asyncio.sleep(interval * random.uniform(0.9, 1.1))
+                    interval = min(interval * 1.5, 15.0)
+
         remind_task = asyncio.create_task(_remind_task())
 
         try:
-            await asyncio.wait_for(event.wait(), timeout=float(timeout))
+            final_status = await asyncio.wait_for(_poll_decision(), timeout=float(timeout))
             remind_task.cancel()
-
-            # 读取决策结果
-            updated = await self._pg.get_approval(approval_id)
-            return updated.status == ApprovalStatus.APPROVED
+            return final_status == ApprovalStatus.APPROVED
 
         except asyncio.TimeoutError:
             remind_task.cancel()
             logger.warning(f"审批 {approval_id} 超时，执行有感知否决")
 
-            # 更新状态
-            await self._pg.update_approval_status(approval_id, ApprovalStatus.TIMEOUT_VETO)
+            # 防止与审批回调并发覆盖：先读最新状态
+            latest = await self._pg.get_approval(approval_id)
+            if latest.status in (ApprovalStatus.APPROVED, ApprovalStatus.REJECTED):
+                return latest.status == ApprovalStatus.APPROVED
+
+            # CAS 更新状态，避免与 on_decision 并发覆盖
+            updated = await self._pg.compare_and_set_status(
+                approval_id=approval_id,
+                from_status=ApprovalStatus.PENDING,
+                to_status=ApprovalStatus.TIMEOUT_VETO,
+            )
+            if not updated:
+                latest = await self._pg.get_approval(approval_id)
+                return latest.status == ApprovalStatus.APPROVED
 
             # 通知发起人（有感知，非静默）
             await self._im.notify(
@@ -1459,13 +1724,20 @@ class HITLApprovalStateMachine:
     async def on_decision(self, approval_id: str, approved: bool, note: str = "") -> None:
         """审批人决策回调（由飞书 Webhook 触发）"""
         status = ApprovalStatus.APPROVED if approved else ApprovalStatus.REJECTED
-        await self._pg.update_approval_status(
-            approval_id, status,
+        updated = await self._pg.compare_and_set_status(
+            approval_id=approval_id,
+            from_status=ApprovalStatus.PENDING,
+            to_status=status,
             decided_at=time.time(), decision_note=note,
         )
-        event = self._pending.get(approval_id)
-        if event:
-            event.set()   # 唤醒等待协程
+        if not updated:
+            latest = await self._pg.get_approval(approval_id)
+            if latest.status == ApprovalStatus.TIMEOUT_VETO:
+                await self._im.notify(
+                    to=latest.approver_id,
+                    message=f"审批 {approval_id} 已超时否决，本次决策未生效。",
+                )
+        # 等待方通过轮询 PG 自动感知状态变化，无需内存 Event
 
 
 # ── HITL 节点（注入 LangGraph）──
@@ -1525,6 +1797,10 @@ class RouterConfig:
     shadow_sample_rate:    float = 0.05    # 高置信度区间抽样率（冷启动期提升至 0.20）
     is_cold_start:         bool  = True    # 冷启动标志（前 1000 次请求）
     cold_start_threshold_high: float = 0.75  # 冷启动期临时下调阈值
+    cold_start_min_requests: int = 1000      # 冷启动退出最小请求数（全局）
+    cold_start_eval_window: int = 200        # 稳定度评估窗口（最近 200 次影子验证）
+    cold_start_max_mismatch_ratio: float = 0.15  # 影子验证不一致率上限
+    refresh_interval_requests: int = 20      # 每 N 次请求刷新一次冷启动状态
 
 class AdaptiveSemanticRouter:
     """
@@ -1538,23 +1814,30 @@ class AdaptiveSemanticRouter:
         vector_db,
         llm_classifier,
         finetune_queue,
+        router_state_store,     # Redis/PG: 记录全局请求数与影子验证稳定度
         config: RouterConfig,
     ):
         self._vdb = vector_db
         self._llm = llm_classifier
         self._finetune_q = finetune_queue
+        self._state = router_state_store
         self.config = config
-        self._request_count = 0
+        self._local_request_count = 0
 
     async def route(self, query: str, tenant_id: str) -> str:
         with tracer.start_as_current_span("SemanticRouter.route") as span:
-            self._request_count += 1
+            self._local_request_count += 1
+            global_req_count = await self._state.incr(
+                key=f"router:{tenant_id}:request_count",
+                delta=1,
+                ttl_secs=7 * 86400,
+            )
 
-            # 冷启动期: 前 1000 次请求逐步过渡
-            if self._request_count == 1000:
-                self.config.is_cold_start = False
-                self.config.shadow_sample_rate = 0.05  # 恢复正常抽样率
-                logger.info("Semantic Router 冷启动期结束，切换正常配置")
+            # 冷启动状态刷新节流：避免每次请求都访问稳定度统计
+            if self.config.is_cold_start and (
+                self._local_request_count % self.config.refresh_interval_requests == 0
+            ):
+                await self._refresh_cold_start(tenant_id, int(global_req_count))
 
             effective_high = (
                 self.config.cold_start_threshold_high
@@ -1570,6 +1853,7 @@ class AdaptiveSemanticRouter:
             span.set_attribute("router.best_score", best.score if best else 0)
             span.set_attribute("router.candidates_count", len(candidates))
             span.set_attribute("router.is_cold_start", self.config.is_cold_start)
+            span.set_attribute("router.global_request_count", int(global_req_count))
 
             # 置信度低于下限: 完全降级 LLM
             if not best or best.score < self.config.threshold_low:
@@ -1588,6 +1872,28 @@ class AdaptiveSemanticRouter:
             span.set_attribute("router.final_intent", best.intent)
             span.set_attribute("router.shadow_triggered", should_shadow)
             return best.intent
+
+    async def _refresh_cold_start(self, tenant_id: str, global_req_count: int) -> None:
+        """冷启动退出条件：全局请求数 + 影子验证稳定度（双条件同时满足）"""
+        stats = await self._state.get_shadow_stats(
+            tenant_id=tenant_id,
+            window=self.config.cold_start_eval_window,
+        )
+        mismatch_ratio = float(stats.get("mismatch_ratio", 1.0))
+        sample_size = int(stats.get("sample_size", 0))
+
+        should_exit = (
+            global_req_count >= self.config.cold_start_min_requests
+            and sample_size >= self.config.cold_start_eval_window
+            and mismatch_ratio <= self.config.cold_start_max_mismatch_ratio
+        )
+        if should_exit and self.config.is_cold_start:
+            self.config.is_cold_start = False
+            self.config.shadow_sample_rate = 0.05
+            logger.info(
+                "Semantic Router 冷启动期结束: "
+                f"req={global_req_count}, sample={sample_size}, mismatch={mismatch_ratio:.2%}"
+            )
 
     async def _llm_fallback(self, query: str, span) -> str:
         """LLM 兜底分类（约 800 Token，低频触发）"""
@@ -1615,6 +1921,11 @@ class AdaptiveSemanticRouter:
                 span.set_attribute("shadow.llm_intent", llm_intent)
                 span.set_attribute("shadow.is_match",   is_match)
                 span.set_attribute("shadow.sr_score",   sr_match.score)
+                await self._state.record_shadow_result(
+                    tenant_id=tenant_id,
+                    is_match=is_match,
+                    ttl_secs=7 * 86400,
+                )
 
                 if not is_match:
                     issue_type = (
@@ -1952,10 +2263,11 @@ class LocalWALStore:
             "_wal_ts":      time.time(),
         }
         wal_path = self._wal_dir / f"{entry_id}.json"
-        # 同步写入（O_SYNC 保证落盘）
+        # 同步写入（flush + fsync 保证落盘）
         with open(wal_path, "w", encoding="utf-8") as f:
             json.dump(wal_entry, f, ensure_ascii=False)
-        os.fsync(f.fileno())   # 强制 fsync，防止断电丢失
+            f.flush()
+            os.fsync(f.fileno())   # 强制 fsync，防止断电丢失
 
     async def mark_sent(self, entry_id: str) -> None:
         """标记已成功同步至 Kafka"""
@@ -2025,8 +2337,10 @@ async def janitor_main(wal: LocalWALStore, kafka_producer, check_interval: int =
 本节在不破坏任务可执行性的前提下，控制“模型可见数据”与“用户最终可见数据”之间的敏感信息暴露面。
 
 ```python
+import json
 import re
 import uuid
+from typing import Dict, List, Tuple
 
 # PII 脱敏规则
 PII_PATTERNS = [
@@ -2044,15 +2358,48 @@ class PIITokenizationGateway:
         self._rbac  = rbac_service
 
     async def tokenize(self, text: str, session_id: str) -> str:
-        """入站脱敏: 敏感信息替换为 TOKEN"""
-        token_map = {}
-        result = text
+        """
+        入站脱敏（Span-based）:
+        1) 全量收集命中 span
+        2) 按位置拼接新字符串
+        3) 严禁使用 str.replace() 逐字替换
+        """
+        token_map: Dict[str, dict] = {}
+        spans: List[Tuple[int, int, str, str]] = []  # start, end, pii_type, original
+
         for pattern, pii_type in PII_PATTERNS:
-            for match in re.finditer(pattern, result):
-                original = match.group()
-                token = f"[{pii_type}_{uuid.uuid4().hex[:8].upper()}]"
-                token_map[token] = original
-                result = result.replace(original, token, 1)
+            for match in re.finditer(pattern, text):
+                spans.append((match.start(), match.end(), pii_type, match.group()))
+
+        # 按起始位置升序、长度降序，优先保留更长的命中，避免子串覆盖
+        spans.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+
+        merged: List[Tuple[int, int, str, str]] = []
+        cursor = -1
+        for start, end, pii_type, original in spans:
+            if start < cursor:
+                continue
+            merged.append((start, end, pii_type, original))
+            cursor = end
+
+        if not merged:
+            return text
+
+        parts: List[str] = []
+        cursor = 0
+        for start, end, pii_type, original in merged:
+            token = f"[{pii_type}_{uuid.uuid4().hex[:8].upper()}]"
+            token_map[token] = {
+                "value": original,
+                "start": start,
+                "end": end,
+                "pii_type": pii_type,
+            }
+            parts.append(text[cursor:start])
+            parts.append(token)
+            cursor = end
+        parts.append(text[cursor:])
+        result = "".join(parts)
 
         if token_map:
             # 加密存储映射表（TTL 与会话同步）
@@ -2073,7 +2420,8 @@ class PIITokenizationGateway:
         has_high_privilege = await self._rbac.has_permission(user_id, "view_pii_raw")
         result = text
 
-        for token, original in token_map.items():
+        for token, payload in token_map.items():
+            original = payload["value"] if isinstance(payload, dict) else payload
             if token in result:
                 if has_high_privilege:
                     result = result.replace(token, original)   # 高权回填原文
@@ -2466,7 +2814,7 @@ M9-M10  生产就绪
   ├─ 全链路压测（重点: 月末报表并发场景）
   ├─ 蓝红对抗演练（Prompt Injection + 越权测试）
   ├─ 第三方安全审计
-  ├─ SR 进入稳定运行区间，切换到常态配置（自动 1000 次触发）
+  ├─ SR 进入稳定运行区间，切换到常态配置（全局请求数 + 稳定度双条件）
   ├─ 强沙箱只对高风险代码执行场景灰度启用
   └─ 全面投产
 ```
@@ -2492,7 +2840,7 @@ M9-M10  生产就绪
 |---|---|---|---|---|
 | **Planner 重试成本失控** | 高 | 高 | 🔴 P0 | Token Budget Guard + 重试上限 2 次 + 有上下文纠错 |
 | **Scratchpad 内存膨胀** | 高 | 高 | 🔴 P0 | 64KB 分片 + 30步滚动压缩 + ClickHouse 独立异步队列 |
-| **SR 冷启动退化** | 高 | 高 | 🔴 P0 | 冷启动阈值 0.75 + 20% 抽样 + 人工标注管道 |
+| **SR 冷启动退化** | 高 | 高 | 🔴 P0 | 冷启动阈值 0.75 + 20% 抽样 + 全局请求数/稳定度双条件退出 + 人工标注管道 |
 | **跨线程资源死锁** | 中 | 高 | 🔴 P0 | 全局工具锁注册表 + 30s 超时 + RESOURCE_CONTENTION 类型化错误 |
 | **HITL 资源泄漏** | 中 | 中 | 🟡 P1 | 三段式状态机 + 资源快照 + 补偿事务 + 催办提醒 |
 | **异步风控追溯不及时** | 中 | 高 | 🟡 P1 | 同步链路仅拦高风险写操作，旁路 DLP 秒级追溯 + 下游网关兜底 |
@@ -2551,6 +2899,7 @@ M9-M10  生产就绪
 3. 若写入中断导致少量孤立 key 或步号不连续，可由 TTL 与后台清理机制自然收敛，不作为首期必须彻底消灭的问题。
 4. 平台只要求“不出现持续性状态错位”，不要求为极低概率异常设计重型一致性协议。
 5. 若后续合规要求提升，再评估是否升级为更严格的跨存储一致性机制。
+6. 命中违规时必须“先留审计证据，再实时熔断”，并禁止将违规内容写入 Redis L1。
 
 ##### 4. `GlobalToolLockRegistry` 热更新采用粗粒度切流策略
 
@@ -2558,11 +2907,27 @@ M9-M10  生产就绪
 
 实施要求如下：
 
-1. 并发配置变更时，允许直接创建并启用新的锁对象或信号量实例。
-2. 旧锁对象上的存量请求允许自然执行完成，不要求回溯驱逐或平滑迁移。
+1. 并发配置变更时，允许直接创建并启用新的分布式配额窗口配置。
+2. 旧配额窗口中的存量持有者允许自然执行完成，不要求回溯驱逐或平滑迁移。
 3. 因配置切换造成的少量超发、超时或任务重试，可统一归类为 `RETRYABLE`。
 4. 每次热更新必须记录工具名、旧并发值、新并发值、生效时间和配置版本。
 5. 平台首期重点是“新配置能够尽快约束新流量”，而不是为低频运维动作投入高复杂度平滑缩容算法。
+6. 分布式信号量必须具备 `lease` 续租机制；长任务在执行期间需周期性续租，避免租约过期导致并发超发。
+7. 必须具备过期 holder 回收机制（请求侧惰性清理 + Janitor 主动清理至少二选一，推荐同时启用），防止配额泄漏。
+8. HITL 超时状态更新必须采用 CAS（仅允许 `PENDING -> TIMEOUT_VETO`），禁止无条件覆盖。
+9. 审批回调写入同样必须采用 CAS（仅允许 `PENDING -> APPROVED/REJECTED`），并对“回调晚到”做显式通知。
+10. HITL 等待轮询必须配置并发上限、指数退避与随机抖动；当审批规模上升时应升级为 `LISTEN/NOTIFY` 或消息总线推送。
+
+##### 4.1 成本与路由状态必须全局一致
+
+Token 预算与冷启动状态均属于“跨 Pod 共享控制面状态”，不得使用仅进程内可见的计数器作为唯一依据。
+
+实施要求如下：
+
+1. Token 消耗必须使用 Redis `INCRBY`（或等价原子操作）作为全局累加器，本地计数仅允许作为短暂降级缓存。
+2. Token 计费应支持 `operation_id` 级幂等，避免重试链路导致重复扣费。
+3. Semantic Router 冷启动退出必须由全局请求计数与稳定度双条件共同判定，不得只依赖单实例请求数。
+4. 冷启动状态刷新必须节流（例如每 N 次请求刷新一次），防止状态检查本身放大存储压力。
 
 #### 三、实施治理约束
 
