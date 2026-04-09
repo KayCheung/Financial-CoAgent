@@ -482,7 +482,7 @@
 - 实现 ToolLockContext（async with 上下文管理器）
 
 **细节补充**：
-- 默认并发配置：oracle_legacy 3、OCR 10、OA 5、风控 8、默认 20
+- 默认并发配置：mysql_legacy 3、OCR 10、OA 5、风控 8、默认 20
 - 过期 holder 回收：请求侧惰性清理（ZREMRANGEBYSCORE）+ 后台 Janitor 定期清理
 - 并发配置热更新：Nacos 变更后直接启用新配额窗口，旧 holder 自然完成
 - 超时错误类型：`RESOURCE_CONTENTION`，可触发 Critic 重试
@@ -619,14 +619,14 @@
 |------|----------|
 | 财务报销闭环率 | 标准发票报销场景自动闭环率 ≥ 85% |
 | PII 脱敏覆盖 | 手机号/身份证/银行卡/邮箱 100% 自动脱敏 |
-| MCP 问数 | 可通过自然语言查询 Oracle/PG 数据库，正确率 ≥ 80% |
+| MCP 问数 | 可通过自然语言查询 MySQL/PG 数据库，正确率 ≥ 80% |
 | 审批卡片 | 飞书/钉钉审批卡片正常推送和回调 |
 
 ### 新增中间件
 
 | 中间件 | 用途 | 部署要求 | 最低资源 |
 |--------|------|----------|----------|
-| Oracle Client | MCP 问数适配 | SDK 安装 | 与应用共用 |
+| MySQL Client | MCP 问数适配 | SDK 安装 | 与应用共用 |
 | ClickHouse | 审计数据长期存储（从二期延后引入） | 单节点 | 2C4G, 200GB SSD |
 
 > **累计资源**：在前两期基础上增加约 6C 12G + 200GB SSD（PII 网关 + MCP 服务 + ClickHouse）
@@ -675,14 +675,14 @@
 
 ---
 
-#### T3.3 MCP 智能问数（含 LegacyOracleAdapter）
+#### T3.3 MCP 智能问数（含 LegacyMySQLAdapter）
 
 **类型**：独立任务  
 **预估工时**：8天
 
 **范围**：
 - 实现 MCP 协议适配层（自然语言 → SQL → 结果）
-- 实现 LegacyOracleAdapter（Oracle 遗留系统适配）
+- 实现 LegacyMySQLAdapter（MySQL 遗留系统适配）
 - 实现查询安全护栏（只读、限行数、禁止 DDL/DML）
 
 **细节补充**：
@@ -690,7 +690,7 @@
 - 安全限制：只允许 SELECT，禁止 INSERT/UPDATE/DELETE/DROP/ALTER
 - 行数限制：默认最多返回 100 行
 - 超时限制：SQL 执行超时 30s
-- Oracle 适配：使用 cx_Oracle/python-oracledb 驱动
+- MySQL 适配：使用 PyMySQL/mysqlclient 驱动
 - 表元数据：预加载表结构和字段注释，提供给 LLM 作为上下文
 - 结果格式：JSON 表格格式 + 可选 Markdown 表格渲染
 

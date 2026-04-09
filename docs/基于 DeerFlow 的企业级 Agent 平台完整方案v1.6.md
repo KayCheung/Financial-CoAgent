@@ -123,7 +123,7 @@
   ├─[执行层] task_2 + task_3 并发执行:
   │           重结果 (MB级) → OSS (经对象存储适配层落盘，Claim-Check)
   │           状态指针 (URI) → Redis CAS 更新
-  │           全局工具锁: oracle_legacy_conn 申请槽位 (max 30s)
+  │           全局工具锁: mysql_legacy_conn 申请槽位 (max 30s)
   │
   ├─[Critic]  发现 3 张发票金额超授权阈值
   │           CriticVetoResult { rule:"FINANCE_002", severity:"high" }
@@ -701,7 +701,7 @@ class GlobalToolLockRegistry:
 
     # 工具并发配置（从 Nacos 热加载）
     DEFAULT_CONCURRENCY = {
-        "oracle_legacy_conn":   3,    # 遗留 Oracle 连接池: 最多 3 并发
+        "mysql_legacy_conn":   3,    # 遗留 MySQL 连接池: 最多 3 并发
         "invoice_ocr":         10,    # OCR 服务: 最多 10 并发
         "oa_submit":            5,    # OA 提交: 最多 5 并发
         "risk_query":           8,    # 风控查询: 最多 8 并发
@@ -977,7 +977,7 @@ class ToolLockContext:
 async def execute_with_lock(tool_name: str, thread_id: str, lock_registry: GlobalToolLockRegistry):
     async with await lock_registry.acquire(tool_name, thread_id, timeout=30.0):
         # 安全区: 工具执行逻辑
-        result = await call_legacy_oracle(thread_id)
+        result = await call_legacy_mysql(thread_id)
         return result
 ```
 
@@ -2918,7 +2918,7 @@ M5-M6  Harness 构建
 
 M7-M8  业务深水区
   ├─ WAL Janitor DaemonSet 独立部署（绑定 PV）
-  ├─ MCP 智能问数（含 LegacyOracleAdapter）
+  ├─ MCP 智能问数（含 LegacyMySQLAdapter）
   ├─ OCR 融合链路上线（PaddleOCR 主解析 + PaddleOCR-VL 局部升维）
   ├─ 财务报销 Agent
   └─ 金融审批 Agent（含 ABAC 多维权限校验）
