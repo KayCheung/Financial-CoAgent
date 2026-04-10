@@ -375,6 +375,7 @@ nodes:
     title: 投资委员会审批
     skill_id: hitl-approval-v1
     dependencies: [n5_risk_score]
+    timeout_s: 86400                  # 与 approval_config.timeout_h 保持一致，供通用节点超时解析使用
     approval_config:
       risk_level: high
       approver_role: investment_committee
@@ -392,6 +393,8 @@ release_gate:
   max_risk_score: 0.75               # 风险分上限（超过则阻断）
   require_approval: true
 ```
+
+模板引擎读取节点超时时，统一优先使用节点级 `timeout_s`；`approval_gate` 的 `approval_config.timeout_h` 仅作为审批业务 SLA 展示与兼容字段，必须与 `timeout_s` 保持一致。
 
 个人尽调模板必须使用独立模板 ID 与工具策略，禁止复用企业模板后在运行时临时裁剪工具：
 
@@ -1334,6 +1337,8 @@ class ThreadWriteGuard:
             )
 ```
 
+前端必须将该 `PermissionError` 映射为 409 冲突响应的用户侧提示：协作者点击“修改执行状态”时，应展示只读提示（例如“阶段一仅线程所有者可修改执行状态，你仍可添加评论或标注”），并保持评论、标注入口可用，避免将 409 作为通用失败弹窗处理。
+
 ---
 
 ## 5. Web Search（受控实时检索）
@@ -1966,7 +1971,8 @@ class SchedulerService:
         due_jobs = await self._pg.get_due_jobs(before_ts=now)
 
         for job in due_jobs:
-            # 幂等检查：同一 job 在同一 tick 内不重复推送
+            # 幂等检查：同一 job 在同一 tick 内不重复推送；TTL 保留 5 个 tick，
+            # 为多 Pod 时钟漂移和 tick 边界重叠预留冗余窗口
             already_queued = await self._redis.setnx(
                 f"scheduler:queued:{job.job_id}:{int(now // self.TICK_INTERVAL_S)}",
                 "1"
@@ -1975,7 +1981,7 @@ class SchedulerService:
                 continue
             await self._redis.expire(
                 f"scheduler:queued:{job.job_id}:{int(now // self.TICK_INTERVAL_S)}",
-                self.TICK_INTERVAL_S * 3
+                self.TICK_INTERVAL_S * 5
             )
 
             await self._redis.xadd(self.SCHEDULER_STREAM, {
@@ -2428,6 +2434,8 @@ def scheduler_span(job_id: str, trigger_type: str):
 | Web Search Skill 版本升级 | `whitelist_hit_rate < 0.60` 或 `credibility_mean < 0.70` | 强制阻断 |
 | 调度器 Worker 升级 | `scheduler_success_rate < 0.95` | 强制阻断 |
 
+其中“尽调规则库变更”的首版基线建立规则与一期 T4.4 首版基线规范对齐：首次上线没有历史基线时，由 AI 算法团队在上线前完成不少于一轮人工标注，形成 `rule_hit_precision` 的固定评测集后，门禁方可生效。
+
 ---
 
 ## 12. 部署规格增量
@@ -2486,7 +2494,7 @@ P2-M3-M4  尽调深水区 + 协同基础版
   └─ 尽调 Skill 红队扫描 + 上架审核
 
 P2-M5  Web Search（合规通过后）
-  ├─ [前置] 合规团队完成网络访问合规审查（M1 并行启动，M5 前必须结论）
+  ├─ [强前置] 本阶段开发工作以合规结论通过为前提；合规未通过则 M5 整体推迟，不得与开发并行推进
   ├─ Search API 封装（Brave/Bing + 结果缓存）
   ├─ Web Search 独立对话入口（Semantic Router → WebSearchConversationGateway）
   ├─ 域名白名单注册表（Nacos，金融监管/权威财经站优先）
