@@ -165,9 +165,23 @@ class AuditStoreFacade:
     async def append(self, event: AuditEvent) -> None:
         await self._wal.write(event.event_id, event)
         await self._hot.append(event)
-        await self._bus.publish(event)
-        await self._cold.upsert_event(event)
+        asyncio.create_task(self._publish_bus(event))
+        asyncio.create_task(self._upsert_cold(event))
+
+    async def _publish_bus(self, event: AuditEvent) -> None:
+        try:
+            await self._bus.publish(event)
+        except Exception as exc:
+            logger.warning("audit bus publish failed; wal janitor will retry: %s", exc, exc_info=True)
+
+    async def _upsert_cold(self, event: AuditEvent) -> None:
+        try:
+            await self._cold.upsert_event(event)
+        except Exception as exc:
+            logger.warning("audit cold upsert failed; wal janitor will retry: %s", exc, exc_info=True)
 ```
+
+`AuditStoreFacade.append()` 的同步路径只包含 WAL 与 `AuditHotStore`：WAL 先写保证可恢复，HotStore 保证在线审计查询可见；`AuditEventBus.publish()` 与 `AuditColdAnalyticsStore.upsert_event()` 为异步投递，失败后由 WAL Janitor 基于 `event_id` 补偿重放，避免 HotStore 成功但 MQ 或冷存储失败时阻塞主链路或要求业务侧回滚。
 
 ```yaml
 # Nacos 配置：审计存储后端选择
@@ -579,7 +593,7 @@ class SubAgentExecutor:
     def __init__(self, node: PlanNode):
         self._node = node
 
-    async def run(self, state: AgentFastState) -> AgentFastState:
+    async def run(self, state: AgentFastState) -> dict:
         allowed_tools = await harness.get_allowed_tools(
             tenant_id=state["tenant_id"],
             requested_tools=self._node.tool_whitelist,
@@ -606,7 +620,6 @@ class SubAgentExecutor:
         )
 
         return {
-            **state,
             "dd_current_node": self._node.node_id,
         }
 ```
@@ -1036,8 +1049,8 @@ evaluation:
 REPORT_GEN 完成
   └─ 写入 dd_report_generated 审计事件
       └─ CollabApprovalOrchestrator 消费事件
-          ├─ 创建/更新 ThreadShareRecord（read_only=true, can_approve=true）
-          ├─ 创建 HITL 审批任务（approval_record）
+          ├─ 创建/更新 ThreadShareRecord（read_only=true, can_approve=false，用于协同只读通知）
+          ├─ 为 primary approver 创建 HITL 审批任务（approval_record）
           ├─ 推送报告 URI + 风险评分 + 关键规则命中
           └─ 审批结果回写 HITL 状态机，不直接改 AgentFastState
 ```
@@ -1265,6 +1278,7 @@ class CollabApprovalOrchestrator:
         if not event.approver_ids:
             return
 
+        primary_approver_id = event.approver_ids[0]
         share = await self._share.create_or_update_share(
             thread_id=event.thread_id,
             tenant_id=event.tenant_id,
@@ -1273,27 +1287,45 @@ class CollabApprovalOrchestrator:
             read_only=True,
             can_comment=True,
             can_annotate=True,
-            can_approve=True,
+            can_approve=False,  # 审批权限仍由一期 HITL 卡片授予 primary approver
         )
 
-        approval_record = await self._hitl.submit(
+        approval_record = ApprovalRecord.create(
             thread_id=event.thread_id,
             tenant_id=event.tenant_id,
+            initiator_id=event.owner_id,
+            approver_id=primary_approver_id,
             task_summary=f"尽调报告审批：plan={event.plan_id}, risk_score={event.risk_score}",
-            approver_ids=event.approver_ids,
-            payload_ref=event.report_uri,
-            metadata={
-                "plan_id": event.plan_id,
-                "risk_score": event.risk_score,
-                "rule_hits": event.rule_hits,
-                "share_id": share.share_id,
+            risk_level="high",
+            resource_snapshot={
+                "report_uri": event.report_uri,
+                "collab_metadata": {
+                    "plan_id": event.plan_id,
+                    "risk_score": event.risk_score,
+                    "rule_hits": event.rule_hits,
+                    "share_id": share.share_id,
+                    "visible_collaborators": event.approver_ids,
+                },
             },
         )
+        approval_id = await self._hitl.submit(approval_record)
+        approval_record.approval_id = approval_id
 
         await self._audit.append(AuditEvent(
             event_id=f"collab_approval:{approval_record.approval_id}",
             tenant_id=event.tenant_id,
             event_type="collab_approval_created",
+            entity_type="dd_plan",
+            entity_id=event.plan_id,
+            payload_hash=sha256(event.report_uri),
+            payload_uri=event.report_uri,
+            operator_id=event.owner_id,
+            occurred_at=time.time(),
+        ))
+        await self._audit.append(AuditEvent(
+            event_id=f"collab_approval_batch:{event.plan_id}:{approval_record.approval_id}",
+            tenant_id=event.tenant_id,
+            event_type="collab_approval_batch_created",
             entity_type="dd_plan",
             entity_id=event.plan_id,
             payload_hash=sha256(event.report_uri),
@@ -1308,6 +1340,8 @@ class CollabApprovalOrchestrator:
             event_type="submitted",
         )
 ```
+
+二期协同审批不修改一期 `HITLApprovalStateMachine.submit(record: ApprovalRecord)` 签名；`CollabApprovalOrchestrator` 先构造一期 `ApprovalRecord`，再调用原接口。二期默认只将 `event.approver_ids[0]` 作为 HITL 决策人，其余人员通过协同分享接收只读通知；如需多人会签/或签，必须新增独立的协同审批适配层或在后续版本显式扩展 HITL 状态机。
 
 ### 4.5 冲突语义与乐观并发（阶段一约束）
 
@@ -1470,12 +1504,14 @@ class WebSearchTool:
         wal_store,
         credibility_scorer,
         domain_registry,             # 从 Nacos 热加载合规白名单
+        pii_audit_redactor,           # 轻量审计掩码，不写 token_map
     ):
         self._api = search_api_client
         self._redis = redis_client
         self._wal = wal_store
         self._scorer = credibility_scorer
         self._domains = domain_registry
+        self._pii_redactor = pii_audit_redactor
 
     async def search(
         self,
@@ -1497,7 +1533,7 @@ class WebSearchTool:
         audit_entry = {
             "event": "web_search_initiated",
             "query_hash": hashlib.sha256(query.encode()).hexdigest(),
-            "redacted_query": pii_gateway.redact(query),
+            "redacted_query": self._pii_redactor.redact(query),
             "tenant_id": tenant_id,
             "operator_id": operator_id,
             "trace_id": trace_id,
@@ -1570,6 +1606,8 @@ class WebSearchTool:
             }
         ))
 ```
+
+`pii_audit_redactor.redact()` 是二期为审计链路新增的轻量掩码适配器，只做手机号、身份证、邮箱、银行卡等敏感片段的不可逆掩码，不写入 `token_map`；需要可逆脱敏时仍调用一期 `PIITokenizationGateway.tokenize(text, session_id)`。
 
 ### 5.4 沙箱隔离：Playwright 专属 Profile（后续评估）
 
@@ -1663,18 +1701,65 @@ class SearchToMemoryPolicy:
     REQUIRE_HUMAN_CONFIRM = True   # 强制要求人工确认后才写入（二期默认开启）
 
     @staticmethod
-    async def can_persist(result: SearchResult, hitl_machine) -> bool:
+    async def can_persist(
+        result: SearchResult,
+        hitl_confirm: "HITLQuickConfirmAdapter",
+        tenant_id: str,
+        operator_id: str,
+        thread_id: str,
+    ) -> bool:
         if result.credibility < SearchToMemoryPolicy.CREDIBILITY_THRESHOLD:
             return False
         if SearchToMemoryPolicy.REQUIRE_HUMAN_CONFIRM:
             # 触发轻量级 HITL（normal 级别，24h 超时）
-            # 复用一期 HITLApprovalStateMachine
-            return await hitl_machine.quick_confirm(
+            # 通过二期适配器复用一期 HITLApprovalStateMachine.submit(record) + wait_for_decision()
+            return await hitl_confirm.quick_confirm(
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                operator_id=operator_id,
                 summary=f"是否将「{result.title}」写入知识库？\n来源: {result.url}",
                 risk_level="normal",
+                resource_snapshot={"search_result_url": result.url},
             )
         return True
+
+
+class HITLQuickConfirmAdapter:
+    """轻量确认适配器，不向一期 HITLApprovalStateMachine 增加 quick_confirm 方法。"""
+
+    def __init__(self, hitl_machine, approval_policy):
+        self._hitl = hitl_machine
+        self._approval_policy = approval_policy
+
+    async def quick_confirm(
+        self,
+        thread_id: str,
+        tenant_id: str,
+        operator_id: str,
+        summary: str,
+        risk_level: str,
+        resource_snapshot: Dict,
+    ) -> bool:
+        approver_id = await self._approval_policy.resolve_l3_approver(
+            tenant_id=tenant_id,
+            operator_id=operator_id,
+            role_key="web_search_l3_approver_role",
+            default_to_operator=True,
+        )
+        record = ApprovalRecord.create(
+            thread_id=thread_id,
+            tenant_id=tenant_id,
+            initiator_id=operator_id,
+            approver_id=approver_id,
+            task_summary=summary,
+            risk_level=risk_level,
+            resource_snapshot=resource_snapshot,
+        )
+        approval_id = await self._hitl.submit(record)
+        return await self._hitl.wait_for_decision(approval_id, record)
 ```
+
+`HITLQuickConfirmAdapter` 默认将 Web Search 结果写入 L3 视为“操作人自我确认”，不是满足内控隔离要求的独立审批。若业务或审计要求独立审批人，必须在 Nacos 配置 `web_search_l3_approver_role`，由 Harness/approval_policy 注入具备该角色的审批人；未配置时不得在材料中将该确认动作描述为独立内控审批。二期不支持按租户豁免 L3 写入前的 HITL 确认；如需豁免，三期需将 `REQUIRE_HUMAN_CONFIRM` 从类级常量改为租户级实例化配置。
 
 ---
 
@@ -1726,9 +1811,18 @@ CREATE TABLE card_watchers (
 
 -- RLS
 ALTER TABLE kanban_boards ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kanban_columns ENABLE ROW LEVEL SECURITY;
 ALTER TABLE kanban_cards  ENABLE ROW LEVEL SECURITY;
 CREATE POLICY board_isolation ON kanban_boards
     USING (tenant_id = current_setting('app.current_tenant')::text);
+CREATE POLICY column_isolation ON kanban_columns
+    USING (
+        EXISTS (
+            SELECT 1 FROM kanban_boards b
+            WHERE b.board_id = kanban_columns.board_id
+              AND b.tenant_id = current_setting('app.current_tenant')::text
+        )
+    );
 CREATE POLICY card_isolation ON kanban_cards
     USING (tenant_id = current_setting('app.current_tenant')::text);
 ```
@@ -1946,6 +2040,7 @@ class SchedulerService:
 
     SCHEDULER_STREAM  = "scheduler:pending_jobs"
     SCHEDULER_GROUP   = "scheduler:workers"
+    SCHEDULER_DLQ     = "scheduler:dead_letter_jobs"
     TICK_INTERVAL_S   = 30           # 每 30 秒扫描一次到期任务
 
     def __init__(
@@ -2002,17 +2097,22 @@ class SchedulerService:
         消费 Redis Stream，执行调度任务。
         每个 worker 以 Consumer Group 模式消费，避免重复执行。
         """
-        await self._redis.xgroup_create(
-            self.SCHEDULER_STREAM,
-            self.SCHEDULER_GROUP,
-            mkstream=True,
-            id="$",
-        )
+        try:
+            await self._redis.xgroup_create(
+                self.SCHEDULER_STREAM,
+                self.SCHEDULER_GROUP,
+                mkstream=True,
+                id="$",
+            )
+        except ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
 
+        consumer_name = f"worker:{socket.gethostname()}"
         while True:
             messages = await self._redis.xreadgroup(
                 groupname=self.SCHEDULER_GROUP,
-                consumername=f"worker:{uuid.uuid4().hex[:8]}",
+                consumername=consumer_name,
                 streams={self.SCHEDULER_STREAM: ">"},
                 count=5,
                 block=5000,
@@ -2020,10 +2120,11 @@ class SchedulerService:
 
             for stream, entries in (messages or []):
                 for msg_id, fields in entries:
-                    await self._execute_job(fields)
-                    await self._redis.xack(self.SCHEDULER_STREAM, self.SCHEDULER_GROUP, msg_id)
+                    should_ack = await self._execute_job(fields)
+                    if should_ack:
+                        await self._redis.xack(self.SCHEDULER_STREAM, self.SCHEDULER_GROUP, msg_id)
 
-    async def _execute_job(self, fields: Dict) -> None:
+    async def _execute_job(self, fields: Dict) -> bool:
         """触发一次 LangGraph workflow 执行"""
         job_id     = fields["job_id"]
         tenant_id  = fields["tenant_id"]
@@ -2056,12 +2157,24 @@ class SchedulerService:
                 token_budget=budget,
             )
             await self._pg.record_job_run(job_id, status="success")
+            return True
         except Exception as exc:
             failure = map_exception_to_failure_state(exc)
             await self._pg.record_job_run(job_id, status="failed", error=str(exc))
             if failure == AgentFailureState.FAILED_CLOSED:
                 await self._pg.disable_job(job_id, reason=str(exc))
+                await self._redis.xadd(self.SCHEDULER_DLQ, {
+                    "job_id": job_id,
+                    "tenant_id": tenant_id,
+                    "skill_id": skill_id,
+                    "error": str(exc),
+                    "failure_state": str(failure),
+                })
+                return True
+            return False
 ```
+
+调度 Worker 只有在执行成功或已写入 `scheduler:dead_letter_jobs` 后才 `XACK`。`RETRYABLE`、`HUMAN_REVIEW` 等非关闭类失败不确认消息，保留在 Pending List，交由重试/人工处理器按 Redis Stream 消费组语义接管，避免失败任务被静默 ack 丢失。Consumer Name 必须是 Pod 生命周期内稳定值（如 `worker:{POD_NAME}` / `worker:{hostname}`），不得每次 `xreadgroup` 使用随机 UUID，否则 Pending List 会按随机 consumer 分散并积压。
 
 ### 7.2.1 调度类具名 Skill
 
@@ -2111,6 +2224,19 @@ schedule_job_templates:
     task_complexity: simple
     max_concurrency: 1
     allowed_sources: [calendar, kanban, dd_plan, pending_approvals]
+    source_access_policy:
+      calendar:
+        tool: calendar_event_list
+        scope: operator_owned
+      kanban:
+        tool: kanban_card_query
+        scope: assignee_or_watcher
+      dd_plan:
+        tool: dd_plan_pending_node_query
+        scope: owner_or_approver
+      pending_approvals:
+        tool: hitl_pending_approval_query
+        scope: approver_self
     output_channel: im
   work_log_summary:
     skill_id: work_log_summary
@@ -2118,8 +2244,26 @@ schedule_job_templates:
     task_complexity: simple
     max_concurrency: 1
     allowed_sources: [thread_summary, scheduler_run_log, dd_plan, kanban, approval_comments]
+    source_access_policy:
+      thread_summary:
+        tool: thread_summary_query
+        scope: owner_or_shared_with
+      scheduler_run_log:
+        tool: scheduler_run_log_query
+        scope: job_owner
+      dd_plan:
+        tool: dd_plan_completed_node_query
+        scope: owner_or_approver
+      kanban:
+        tool: kanban_card_event_query
+        scope: assignee_or_watcher
+      approval_comments:
+        tool: approval_comment_query
+        scope: approver_or_thread_owner
     output_channel: im
 ```
+
+`allowed_sources` 仅作为模板声明，Harness 实际授权必须以 `source_access_policy` 中的工具条目和访问范围为准。管理员或上级角色若需查看他人日历、看板或审批数据，必须通过 ABAC 显式授予 `delegated_view` / `team_admin_view` 范围；默认不得因 `role=admin` 自动扩大数据可见性。
 
 ### 7.3 外部触发 LangGraph 接口
 
@@ -2486,8 +2630,7 @@ P2-M3-M4  尽调深水区 + 协同基础版
   ├─ 尽调外部数据接入（工商 API + Tool 白名单更新）
   ├─ 尽调报告生成 Skill（长上下文模型，PDF/DOCX 输出）
   ├─ 尽调合规存档（OSS KMS 加密 + 7 年 TTL）
-  ├─ 协同服务：共享线程数据模型 + RLS
-  ├─ 评论与标注服务（CommentService + WAL 审计）
+  ├─ 评论与标注服务 + 共享线程数据模型（含 RLS）
   ├─ 尽调报告完成后自动创建协同审批任务（CollabApprovalOrchestrator）
   ├─ 多人审批通知扩展（CollabNotificationExtension）
   ├─ Evaluation 尽调流程回放门禁接入 CI/CD
