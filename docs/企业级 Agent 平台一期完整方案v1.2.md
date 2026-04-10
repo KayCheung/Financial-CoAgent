@@ -1,4 +1,4 @@
-# 基于 DeerFlow 的企业级 Agent 平台完整方案
+# 企业级 Agent 平台一期完整方案
 
 > **版本**：v1.2（生产级优化版） | **技术基座**：DeerFlow 2.0 + LangGraph 1.0 + LangChain
 > **许可证**：MIT（DeerFlow 原生） | **目标场景**：金融企业私有化部署

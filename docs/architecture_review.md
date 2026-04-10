@@ -1,7 +1,7 @@
 # 企业级 Agent 平台方案 v1.5 — 架构评审报告
 
 > **评审视角**：Agent 平台架构师  
-> **评审对象**：[基于 DeerFlow 的企业级 Agent 平台完整方案v1.5](file:///e:/Workspace/CodeRepository/kltb/finance-agent/Financial-CoAgent/docs/基于%20DeerFlow%20的企业级%20Agent%20平台完整方案v1.5.md)  
+> **评审对象**：[企业级 Agent 平台一期完整方案v1.5](file:///e:/Workspace/CodeRepository/kltb/finance-agent/Financial-CoAgent/docs/企业级%20Agent%20平台一期完整方案v1.5.md)  
 > **评审日期**：2026-04-08
 
 ---
