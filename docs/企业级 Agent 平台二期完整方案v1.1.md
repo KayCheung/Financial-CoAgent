@@ -107,8 +107,10 @@
 业务模块只能依赖上述接口，不直接依赖 `clickhouse-driver`、SQLAlchemy ClickHouse 方言或具体 ClickHouse 表名。三期接入 ClickHouse 时，仅替换 `AuditColdAnalyticsStore` 实现和迁移脚本，不修改尽调、调度器、Web Search、协同服务的业务流程。
 
 ```python
+from dataclasses import dataclass
 from typing import Protocol, Optional, Dict, List
 
+@dataclass
 class AuditEvent:
     event_id: str
     tenant_id: str
@@ -684,6 +686,7 @@ class MultiAgentTaskGateway:
 - 只允许触发已发布模板，不提供自由拖拽、自由新增 Agent、自由配置工具的开放式 Agent Studio。
 - 模板发布仍走 Skill 上架审核、工具白名单、Evaluation 回放门禁与租户级灰度。
 - 用户输入只能影响 `target_entity`、证据引用、审批人等业务参数，不能直接覆盖 `tool_whitelist`、`agent_role`、`dependencies`。
+- 子 Agent 中间结果必须通过 Claim-Check 引用传递；不允许将 MB 级结构化 JSON、长文本证据包或二进制内容直接写入 `AgentFastState`、节点返回 dict 或 `payload_refs` 的 value。
 - 开放式 Agent Studio 作为三期或后续专项评估，不进入二期交付范围。
 
 ### 3.4 尽调评分与 Critic 规则集
@@ -882,6 +885,14 @@ class DDReflectionGate:
         missing = required_fields - set(report.keys())
         if missing:
             findings.append(f"报告缺少必填字段: {sorted(missing)}")
+        required_sections = {"financial", "legal", "compliance", "risk_conclusion"}
+        missing_sections = required_sections - set(report.get("sections", []))
+        if missing_sections:
+            findings.append(f"报告缺少必要章节: {sorted(missing_sections)}")
+        required_non_empty = {"enterprise_name", "investigation_date", "risk_score"}
+        empty_fields = [field for field in required_non_empty if not report.get(field)]
+        if empty_fields:
+            findings.append(f"报告关键字段为空: {sorted(empty_fields)}")
         if not report.get("evidence_refs"):
             findings.append("报告缺少证据链引用")
 
@@ -1373,6 +1384,8 @@ class ThreadWriteGuard:
 
 前端必须将该 `PermissionError` 映射为 409 冲突响应的用户侧提示：协作者点击“修改执行状态”时，应展示只读提示（例如“阶段一仅线程所有者可修改执行状态，你仍可添加评论或标注”），并保持评论、标注入口可用，避免将 409 作为通用失败弹窗处理。
 
+阶段一的只读约束不能只依赖 Python 层守卫。应用入口必须统一经过 `ThreadWriteGuard` / Harness 鉴权；若后续将执行态命令表、线程写入指令或镜像状态落入 PG，则对应表应同步增加 RLS 或等价存储层约束，确保只有 `owner_id = current_setting('app.current_user')` 的主体可更新，形成入口层与存储层双重防护。
+
 ---
 
 ## 5. Web Search（受控实时检索）
@@ -1412,6 +1425,7 @@ class WebSearchRequest:
     query:         str
     max_results:   int = 5
     persist_to_l3: bool = False  # 默认不写入 L3，需走 5.6 准入策略
+    task_complexity: str = "simple"  # 独立入口默认 simple（5,000 tokens）
 
 
 @dataclass
@@ -1430,6 +1444,14 @@ class WebSearchConversationGateway:
     """
 
     async def invoke(self, req: WebSearchRequest) -> WebSearchResponse:
+        if req.task_complexity != "simple":
+            raise ValueError("独立 Web Search 对话入口仅允许 simple 预算档位")
+
+        budget = TokenBudget.allocate(
+            thread_id=req.thread_id,
+            tenant_id=req.tenant_id,
+            task_complexity="simple",
+        )
         allowed_tools = await harness.get_allowed_tools(
             tenant_id=req.tenant_id,
             requested_tools=["web_search"],
@@ -1457,6 +1479,8 @@ class WebSearchConversationGateway:
             no_result=(len(results) == 0),
         )
 ```
+
+独立 Web Search 对话入口默认走 `simple` 预算档位（5,000 tokens），且不允许用户自行升档；该入口的预算与尽调流程中的 `moderate` / `complex` 配额隔离，避免通过对话入口绕开尽调预算上限。
 
 前端渲染要求：
 
@@ -2066,17 +2090,21 @@ class SchedulerService:
         due_jobs = await self._pg.get_due_jobs(before_ts=now)
 
         for job in due_jobs:
-            # 幂等检查：同一 job 在同一 tick 内不重复推送；TTL 保留 5 个 tick，
-            # 为多 Pod 时钟漂移和 tick 边界重叠预留冗余窗口
+            # 幂等检查：同一 job 在同一 tick 内不重复推送；
+            # TTL 至少覆盖任务预期最长执行时间的 1.5 倍，未配置 timeout_s 时退回 5 个 tick
             already_queued = await self._redis.setnx(
                 f"scheduler:queued:{job.job_id}:{int(now // self.TICK_INTERVAL_S)}",
                 "1"
             )
             if not already_queued:
                 continue
+            idempotency_ttl = max(
+                self.TICK_INTERVAL_S * 5,
+                int(job.timeout_s * 1.5) if getattr(job, "timeout_s", 0) else 0,
+            )
             await self._redis.expire(
                 f"scheduler:queued:{job.job_id}:{int(now // self.TICK_INTERVAL_S)}",
-                self.TICK_INTERVAL_S * 5
+                idempotency_ttl
             )
 
             await self._redis.xadd(self.SCHEDULER_STREAM, {
@@ -2646,6 +2674,8 @@ P2-M5  Web Search（合规通过后）
   ├─ Search → L3 记忆准入策略（HITL 确认模式）
   ├─ Evaluation Web Search 质量基线 + 发布门禁
   └─ Web Search Skill 上架（canary 10% 灰度，仅 investment_div）
+
+若 M4 结束时合规仍未给出通过结论，则 M5 整体切换为“技术预研月”：仅允许进行 Search API 沙箱 Profile 评估、域名白名单设计与审计字段预留，不启动正式开发；后续 Web Search 交付里程碑整体顺延。
 
 P2-M6  看板 + 调度器
   ├─ 看板 PG 表上线（board/column/card/watchers）
