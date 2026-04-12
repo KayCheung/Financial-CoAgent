@@ -209,3 +209,13 @@ __marimo__/
 
 server/coagent.db
 server/coagent.db-journal
+
+node_modules
+dist
+build
+out
+.DS_Store
+.eslintcache
+*.log*
+.next/
+.cache/
