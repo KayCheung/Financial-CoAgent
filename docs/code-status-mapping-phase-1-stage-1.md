@@ -21,7 +21,7 @@
 | T1.3 | Semantic Router 基础版 | 未实现 | 未见意图路由、向量检索、Milvus 接入 |
 | T1.4 | Token Budget 守护机制 | 半实现 | 只有粗粒度 token 估算与 usage 统计，没有预算守护和熔断 |
 | T1.5 | Planner 防死锁机制 | 未实现 | stage 事件是前端展示壳，不是 DAG Planner |
-| T1.6 | PaddleOCR 发票解析服务 | 未实现 | 只有通用文件上传，没有 OCR 服务或发票抽取 |
+| T1.6 | PaddleOCR 发票解析服务 | 半实现 | 有 `invoice_ocr` 路由、独立 OCR 阶段、远程 OCR 入口与启发式字段/置信度；未内嵌 Paddle 推理服务 |
 | T1.7 | 知识库 Agent（第一个 Skill） | 未实现 | 未见知识入库、检索、RAG 或 Skill 路由 |
 | T1.8 | WAL 双写审计基础版 | 半实现 | 有消息/流事件持久化，但不是 WAL + 审计总线 |
 | T1.9 | 基础前端界面 | 已实现 | 聊天、历史、SSE、上传、stage 面板基本可用 |
@@ -138,22 +138,23 @@
 
 ### T1.6 PaddleOCR 发票解析服务
 
-- 状态：`未实现`
+- 状态：`半实现`
 - 现有证据：
   - [server/app/api/files.py](E:/Workspace/CodeRepository/opensource/phase-1-stage-1/server/app/api/files.py:1)
+  - [server/app/services/ocr_service.py](E:/Workspace/CodeRepository/opensource/phase-1-stage-1/server/app/services/ocr_service.py:1)
+  - [server/app/services/chat_runtime.py](E:/Workspace/CodeRepository/opensource/phase-1-stage-1/server/app/services/chat_runtime.py:1)
+  - [server/app/agent/orchestrator.py](E:/Workspace/CodeRepository/opensource/phase-1-stage-1/server/app/agent/orchestrator.py:1)
 - 已有能力：
-  - 文件上传
-  - 用户级本地目录保存
+  - 文件上传与用户级本地路径解析（`doc_uri` / `file_url`）
+  - `invoice_ocr` 意图下独立 `ocr` 阶段，工具名为 `invoice_ocr`
+  - 可选远程 OCR（`REMOTE_OCR_URL`），失败时本地可读文本回退
+  - 发票字段正则抽取、启发式 `confidence`、无效附件带 `failure_reason` 而非静默丢弃
 - 缺失能力：
-  - OCR 服务
-  - 发票字段抽取
-  - 置信度
-  - OCR Tool
-  - Claim-Check 规范化设计
-- 判断：
-  - 现在只是通用上传，不是 OCR 链路
+  - 仓库内嵌 PaddleOCR 推理与模型运维
+  - 生产级验真、复杂版式与 PDF 全链路
+  - Claim-Check 与统一 Tool Schema 注册中心
 - 建议接入方式：
-  - `复用上传入口的一部分，新增 OCR 服务与工具层`
+  - 继续强化远程 OCR 契约与字段规则；必要时单独部署 OCR 推理服务
 
 ### T1.7 知识库 Agent（第一个 Skill）
 

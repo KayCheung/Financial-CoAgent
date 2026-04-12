@@ -292,10 +292,14 @@ class ChatRuntime:
                         {
                             "attachment_id": item.attachment_id,
                             "file_name": item.file_name,
+                            "doc_uri": item.doc_uri,
                             "provider": item.provider,
                             "summary": item.summary,
                             "extracted_text": item.extracted_text,
                             "parsed_fields": item.parsed_fields,
+                            "confidence": item.confidence,
+                            "status": item.status,
+                            "failure_reason": item.failure_reason,
                         }
                         for item in ocr_results
                     ]
@@ -308,15 +312,19 @@ class ChatRuntime:
                         payload={
                             "stage_key": "ocr",
                             "status": "completed",
-                            "tool_name": "ocr_service",
+                            "tool_name": "invoice_ocr",
                             "summary": f"已处理 {len(ocr_results)} 个附件",
                             "ocr_results": [
                                 {
                                     "attachment_id": item.attachment_id,
                                     "file_name": item.file_name,
+                                    "doc_uri": item.doc_uri,
                                     "provider": item.provider,
                                     "summary": item.summary,
                                     "parsed_fields": item.parsed_fields,
+                                    "confidence": item.confidence,
+                                    "status": item.status,
+                                    "failure_reason": item.failure_reason,
                                 }
                                 for item in ocr_results
                             ],

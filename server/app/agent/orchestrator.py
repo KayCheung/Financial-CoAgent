@@ -160,10 +160,16 @@ class AgentOrchestrator:
             for item in ocr_results:
                 if isinstance(item, dict):
                     fields = item.get("parsed_fields") or {}
+                    conf = item.get("confidence") or {}
                     field_text = ", ".join(f"{key}={value}" for key, value in fields.items()) if isinstance(fields, dict) else ""
+                    conf_text = ""
+                    if isinstance(conf, dict) and conf:
+                        conf_text = ", ".join(f"{k}:{v:.2f}" for k, v in conf.items())
                     line = f"- {item.get('file_name')}: {item.get('summary')}"
                     if field_text:
                         line += f" ({field_text})"
+                    if conf_text:
+                        line += f" [置信度 {conf_text}]"
                     ocr_lines.append(line)
             if ocr_lines:
                 messages.append(
@@ -196,10 +202,13 @@ class AgentOrchestrator:
                 for item in ocr_results:
                     if isinstance(item, dict):
                         fields = item.get("parsed_fields") or {}
+                        conf = item.get("confidence") or {}
                         lines.append(f"{item.get('file_name')}: {item.get('summary')}")
                         if isinstance(fields, dict) and fields:
                             for key, value in fields.items():
-                                lines.append(f"  {key}: {value}")
+                                c = conf.get(key) if isinstance(conf, dict) else None
+                                suffix = f" (conf={c:.2f})" if isinstance(c, (int, float)) else ""
+                                lines.append(f"  {key}: {value}{suffix}")
                         extracted_text = item.get("extracted_text")
                         if isinstance(extracted_text, str) and extracted_text:
                             lines.append(f"  raw_text: {extracted_text}")

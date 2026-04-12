@@ -49,3 +49,8 @@ def test_invoice_ocr_stage_contains_structured_fields():
     assert parsed_fields["invoice_number"] == "INV-9001"
     assert parsed_fields["amount"] == "88.50"
     assert parsed_fields["currency"] == "CNY"
+    assert ocr_results[0]["status"] == "ok"
+    assert ocr_results[0]["doc_uri"].startswith("/uploads/")
+    conf = ocr_results[0]["confidence"]
+    assert conf["invoice_number"] >= 0.8
+    assert conf["amount"] >= 0.8

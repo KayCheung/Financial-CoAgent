@@ -12,6 +12,7 @@
 - `chat_runtime.py` 主链路已走 `prepare()` + `stream_response()`。
 - 已新增 `server/app/services/ocr_service.py`。
 - `invoice_ocr + attachments` 现在会产生独立 `ocr` 阶段，并将 OCR 文本和结构化字段注入最终回复上下文。
+- OCR 阶段事件已对齐 T1.6 工具侧契约：`doc_uri`、`parsed_fields`、`confidence`、`status` / `failure_reason`；无效附件不再静默跳过；`tool_name` 使用 `invoice_ocr`。
 - 本地验证环境：
   - PostgreSQL：`127.0.0.1:15432`
   - Nacos：`127.0.0.1:8848`
@@ -24,7 +25,7 @@
   - `alembic upgrade head`
   - `pytest -q`
 - 当前测试状态：
-  - `14 passed`
+  - `16 passed`
 - 下一步目标：
   - 继续推进 `P2.2 / T1.6 OCR`
   - 然后继续补强 `P2.2` 的工具化与结构化能力
@@ -143,29 +144,15 @@
 
 ## 当前暂停点
 
-暂停在“P1.1 第一轮完成，准备进入 P1.2 PostgreSQL 迁移准备”的节点。
-
-下一次恢复时，不要直接写代码，先完成：
-
-1. 阅读 `implementation-plan-phase-1-stage-1.md`
-2. 只聚焦一期实施方案中的 `T1.*`
-3. 从 `P1.2` 开始
-4. 先把当前存储层整理到更接近 PostgreSQL 的形状
+暂停在 **`P2.2 / T1.6 OCR` 第二轮持续迭代**：工具化结果结构（doc_uri、confidence、状态与失败原因）已与方案对齐一轮，主链路与 SSE 仍兼容。
 
 ## 下一步
 
-恢复后第一件事：
+继续按 [implementation-plan-phase-1-stage-1.md](E:/Workspace/CodeRepository/opensource/phase-1-stage-1/docs/implementation-plan-phase-1-stage-1.md:1) 推进 **`P2.2 / T1.6`**：
 
-基于下面这份文件继续实际实现：
-
-- [implementation-plan-phase-1-stage-1.md](E:/Workspace/CodeRepository/opensource/phase-1-stage-1/docs/implementation-plan-phase-1-stage-1.md:1)
-
-输出目标：
-
-- 完成 `P1.2`
-- 让当前存储层摆脱 SQLite 心智依赖
-- 为 PG / RLS 接入提前整理字段和边界
-- 不破坏现有 SSE 协议和前端体验
+- 在真实远程 PaddleOCR（或已配置的 `REMOTE_OCR_URL`）上验证端到端字段与置信度表现。
+- 继续补强结构化抽取规则与工具执行边界（例如 PDF/图片分支、错误码细分）。
+- 不破坏现有 SSE 协议和前端体验。
 
 ## 恢复步骤
 
@@ -180,7 +167,7 @@
 4. 先看：
    - `当前暂停点`
    - `下一步`
-5. 然后从 `P1.2` 开始编码
+5. 然后从实施 Plan 中的当前项（现为 `P2.2`）继续编码
 
 ## 工作习惯约定
 
@@ -198,7 +185,7 @@
 
 ## 最近一次确认
 
-- worktree 已切换成功
+- worktree：`E:/Workspace/CodeRepository/opensource/phase-1-stage-1`
 - 当前分支：`feature/phase-1-stage-1`
-- 当前工作区：已有本轮修改，未提交
-- 当前建议：继续按小型实施 Plan，进入 `P1.2`
+- 本轮改动：`ocr_service` 结果结构扩展、`chat_runtime` / `orchestrator` 透传、测试补强；`pytest -q` 已通过（`16 passed`）
+- 当前建议：继续 `P2.2 / T1.6`，对接真实 OCR 服务做联调与规则迭代
