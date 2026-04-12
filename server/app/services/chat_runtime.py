@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.agent.orchestrator import OrchestratorState, StreamInput, agent_orchestrator
+from app.services.audit_store import AuditEntry, audit_store
 from app.services.session_store import ChatMessage, session_store
 from app.services.token_budget import BudgetExceededError, TokenBudget, token_budget_guard
 from app.services.usage_tracker import estimate_tokens, stub_cost_usd, usage_tracker
@@ -80,6 +81,8 @@ class ChatRuntime:
         self,
         *,
         user_id: str,
+        tenant_id: str = "dev-tenant",
+        role: str = "operator",
         session_id: str,
         user_message: str,
         attachments: list[dict[str, Any]] | None,
@@ -203,7 +206,9 @@ class ChatRuntime:
                     user_message=user_snapshot,
                     history=history,
                     sent_prefix=sent_prefix,
+                    tenant_id=tenant_id,
                     user_id=user_id,
+                    role=role,
                 )
             )
             async with self._lock:
@@ -309,16 +314,7 @@ class ChatRuntime:
             )
             try:
                 progress_emitted = False
-                async for piece in agent_orchestrator.stream(
-                    StreamInput(
-                        session_id=session_id,
-                        user_message=user_snapshot,
-                        history=history,
-                        sent_prefix=sent_prefix,
-                        user_id=user_id,
-                    ),
-                    cancel,
-                ):
+                async for piece in agent_orchestrator.stream_response(state, cancel):
                     if cancel.is_set():
                         partial = sent_prefix + "".join(output_parts)
                         tok = str(uuid.uuid4())
@@ -631,7 +627,39 @@ class ChatRuntime:
         }
         session_store.append_stream_event(event)
         self._update_stage_snapshot(event)
+        self._append_audit_entry(event)
         return ChatRuntime._sse(event)
+
+    def _append_audit_entry(self, event: dict[str, Any]) -> None:
+        event_type = event.get("event_type")
+        if event_type not in {
+            "stage_started",
+            "stage_completed",
+            "stage_failed",
+            "error",
+            "checkpoint",
+            "cost_event",
+            "budget_event",
+            "completed",
+        }:
+            return
+
+        payload = event.get("payload") or {}
+        audit_store.append(
+            AuditEntry(
+                session_id=event["session_id"],
+                run_id=event["run_id"],
+                trace_id=event["trace_id"],
+                event_type=event_type,
+                payload={
+                    "event_id": event["event_id"],
+                    "thread_id": event["thread_id"],
+                    "seq": event["seq"],
+                    "payload": payload,
+                    "server_ts": event["server_ts"],
+                },
+            )
+        )
 
     def _update_stage_snapshot(self, event: dict[str, Any]) -> None:
         session_id = event.get("session_id")

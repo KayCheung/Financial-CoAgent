@@ -23,6 +23,8 @@ async def chat_stream(
     _ensure_session(principal, payload.session_id)
     gen = chat_runtime.stream_chat(
         user_id=principal.user_id,
+        tenant_id=principal.tenant_id,
+        role=principal.role,
         session_id=payload.session_id,
         user_message=payload.message,
         attachments=payload.attachments,
@@ -45,6 +47,8 @@ async def chat_resume(
     _ensure_session(principal, payload.session_id)
     gen = chat_runtime.stream_chat(
         user_id=principal.user_id,
+        tenant_id=principal.tenant_id,
+        role=principal.role,
         session_id=payload.session_id,
         user_message="",
         attachments=[],

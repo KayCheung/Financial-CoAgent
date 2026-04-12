@@ -4,10 +4,10 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, Integer, String, create_engine, select
+from sqlalchemy import DateTime, Float, Integer, String, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from app.core.config import get_settings
+from app.core.database import build_engine, should_auto_create_schema
 
 
 @dataclass
@@ -40,10 +40,10 @@ class UsageRecordModel(Base):
 
 class UsageTracker:
     def __init__(self) -> None:
-        settings = get_settings()
-        self._engine = create_engine(settings.database_url, future=True)
+        self._engine = build_engine()
         self._session_factory = sessionmaker(self._engine, expire_on_commit=False, class_=Session)
-        Base.metadata.create_all(self._engine)
+        if should_auto_create_schema():
+            Base.metadata.create_all(self._engine)
 
     def _db(self) -> Session:
         return self._session_factory()

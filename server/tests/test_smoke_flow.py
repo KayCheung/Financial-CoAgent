@@ -99,14 +99,14 @@ def test_resume_completes_and_persists_assistant():
 
     collected: list[str] = []
 
-    async def _slow_stream(_stream_input, cancel):
+    async def _slow_stream_response(_state, cancel):
         parts = ["alpha ", "beta ", "gamma ", "done"]
         for p in parts:
             yield p
             await asyncio.sleep(0.05)
 
     def run_stream():
-        with patch.object(agent_orchestrator, "stream", _slow_stream):
+        with patch.object(agent_orchestrator, "stream_response", _slow_stream_response):
             with client.stream(
                 "POST",
                 "/api/v1/chat/stream",

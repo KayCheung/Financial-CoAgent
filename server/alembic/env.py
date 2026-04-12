@@ -11,18 +11,18 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.core.config import get_settings
+from app.core.database import get_database_url
+from app.services.audit_store import Base as AuditBase
 from app.services.session_store import Base as SessionBase
 from app.services.usage_tracker import Base as UsageBase
 
 config = context.config
-settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.database_url)
+config.set_main_option("sqlalchemy.url", get_database_url())
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-target_metadata = [SessionBase.metadata, UsageBase.metadata]
+target_metadata = [SessionBase.metadata, UsageBase.metadata, AuditBase.metadata]
 
 
 def run_migrations_offline() -> None:

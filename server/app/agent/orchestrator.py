@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from app.agent.router import semantic_router
 from app.core.config import get_settings
 from app.services.session_store import ChatMessage
 
@@ -30,6 +31,7 @@ class StreamInput:
     sent_prefix: str = ""
     tenant_id: str = "dev-tenant"
     user_id: str = "dev-user"
+    role: str = "operator"
 
 
 @dataclass(slots=True)
@@ -59,6 +61,7 @@ class OrchestratorState:
     thread_id: str
     tenant_id: str
     user_id: str
+    role: str
     user_message: str
     sent_prefix: str
     history: list[ChatMessage]
@@ -92,6 +95,7 @@ class AgentOrchestrator:
             thread_id=req.session_id,
             tenant_id=req.tenant_id,
             user_id=req.user_id,
+            role=req.role,
             user_message=req.user_message,
             sent_prefix=req.sent_prefix,
             history=req.history,
@@ -124,12 +128,12 @@ class AgentOrchestrator:
             yield text
 
     def _route(self, state: OrchestratorState) -> RouteResult:
-        text = state.user_message.lower()
-        if any(word in text for word in ("发票", "ocr", "票据")):
-            return RouteResult(intent="invoice_ocr", confidence=0.76, summary="识别为票据/OCR相关请求")
-        if any(word in text for word in ("知识库", "文档", "检索")):
-            return RouteResult(intent="knowledge_qa", confidence=0.72, summary="识别为知识检索型请求")
-        return RouteResult(intent="general_chat", confidence=0.68, summary="按通用金融助手对话处理")
+        decision = semantic_router.route(state.user_message)
+        return RouteResult(
+            intent=decision.intent,
+            confidence=decision.confidence,
+            summary=decision.summary,
+        )
 
     def _plan(self, state: OrchestratorState) -> ExecutionPlan:
         route = state.route or self._route(state)

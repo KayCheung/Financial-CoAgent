@@ -9,7 +9,7 @@ from typing import Any, Literal
 from sqlalchemy import JSON, Boolean, DateTime, Integer, String, Text, and_, create_engine, func, or_, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from app.core.config import get_settings
+from app.core.database import build_engine, should_auto_create_schema
 
 SessionType = Literal["chat", "task", "finance", "assistant", "biz"]
 SessionStatus = Literal["active", "archived"]
@@ -102,15 +102,11 @@ class SessionRecord:
 
 class SessionStore:
     def __init__(self) -> None:
-        settings = get_settings()
-        db_url = getattr(settings, "database_url", None) or "sqlite:///./coagent.db"
-        connect_args: dict = {}
-        if isinstance(db_url, str) and db_url.startswith("sqlite"):
-            connect_args["check_same_thread"] = False
-        self._engine = create_engine(db_url, future=True, connect_args=connect_args)
+        self._engine = build_engine()
         self._session_factory = sessionmaker(self._engine, expire_on_commit=False, class_=Session)
         self._seq_cursor: dict[str, int] = {}
-        Base.metadata.create_all(self._engine)
+        if should_auto_create_schema():
+            Base.metadata.create_all(self._engine)
 
     def _db(self) -> Session:
         return self._session_factory()

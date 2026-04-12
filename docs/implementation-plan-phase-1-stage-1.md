@@ -1,5 +1,31 @@
 # 当前 Worktree 小型实施 Plan - phase-1-stage-1
 
+## Latest Status
+
+- `P0.1` complete
+- `P0.2` complete
+- `P0.3` complete
+- `P1.1` complete
+- `P1.2` first round complete
+
+### P1.2 Completion Notes
+
+- Introduced unified database entrypoint: `server/app/core/database.py`
+- Datasource resolution order is now:
+  1. explicit `DATABASE_URL`
+  2. Nacos datasource YAML
+  3. sqlite fallback
+- Nacos client uses the official Python SDK, not a handwritten HTTP adapter
+- Alembic is wired to the unified database URL
+- `audit_entries` is now part of the migration chain
+- PostgreSQL migration path has been locally validated
+
+### Next Step
+
+- Continue `P2.1 / T1.3 Semantic Router`
+- Keep deleting dependence on the temporary keyword path instead of extending it
+- After router stabilization, move to `P2.2 / T1.6 OCR`
+
 ## 目标
 
 基于当前 worktree 的现有 MVP 代码，收敛出一个适合“一期阶段一”的实际落地顺序。
@@ -197,6 +223,19 @@
 - 关键执行节点有独立审计 entry
 - 审计与会话消息不再混为一层概念
 
+#### 当前进展
+
+- 已完成第一轮基础实现
+- 当前已具备：
+  - 独立 `AuditEntry` / `AuditStore` 模块
+  - 本地 WAL 文件落盘
+  - 热审计表 `audit_entries`
+  - chat runtime 对关键事件的审计写入
+- 当前仍未做：
+  - MQ 总线
+  - Janitor 重放
+  - 更细粒度审计 schema 与回放器
+
 ---
 
 ### P1.1 T1.1 鉴权向 JWT/tenant 上下文过渡
@@ -223,6 +262,18 @@
 
 - 后端主链路不再默认只有单一 dev 用户语义
 
+#### 当前进展
+
+- 已完成第一轮基础实现
+- 当前已具备：
+  - 开发态可解析 token
+  - `Principal` 扩展为 `user_id / name / tenant_id / role / raw_token`
+  - chat 主链路已透传 tenant/role 上下文
+- 当前仍未做：
+  - 真正的 JWT 验签
+  - 网关注入 Header
+  - 多租户权限矩阵与细粒度鉴权
+
 ---
 
 ### P1.2 T1.11 PostgreSQL 迁移准备
@@ -245,6 +296,19 @@
 #### 交付标准
 
 - 存储层代码不再强绑定 SQLite 心智
+
+#### 当前进展
+
+- 已完成第一轮基础实现
+- 当前已具备：
+  - 统一数据库入口 `app/core/database.py`
+  - 优先通过官方 Nacos Python SDK 读取 datasource
+  - Alembic 已可直接迁移到本地 PostgreSQL
+  - 审计表 `audit_entries` 已纳入迁移链
+- 当前仍未做：
+  - 真正的 RLS
+  - tenant 维度字段补齐
+  - PostgreSQL 专项索引与性能策略
 
 ---
 

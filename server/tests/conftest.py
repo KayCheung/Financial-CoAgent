@@ -15,3 +15,6 @@ if str(ROOT) not in sys.path:
 TMP_DIR = Path(tempfile.gettempdir()) / "financial-coagent-tests"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("DATABASE_URL", f"sqlite:///{(TMP_DIR / 'coagent-test.db').as_posix()}")
+AUDIT_WAL_DIR = TMP_DIR / "audit-wal"
+AUDIT_WAL_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("AUDIT_WAL_DIR", str(AUDIT_WAL_DIR))

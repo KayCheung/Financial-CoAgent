@@ -10,3 +10,6 @@ sqlalchemy
 alembic
 psycopg2-binary
 python-multipart
+PyYAML
+nacos-sdk-python==3.0.4
+nacos-sdk-python==3.0.4

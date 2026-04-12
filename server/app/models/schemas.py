@@ -18,6 +18,10 @@ class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     expires_in: int = 3600
+    user_id: str | None = None
+    user_name: str | None = None
+    tenant_id: str | None = None
+    role: str | None = None
 
 
 class SessionCreate(BaseModel):

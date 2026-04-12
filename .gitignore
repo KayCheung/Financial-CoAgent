@@ -209,3 +209,7 @@ __marimo__/
 
 server/coagent.db
 server/coagent.db-journal
+server/.nacos_runtime/
+server/pytest-cache-files-*/
+server/.nacos_runtime/
+server/pytest-cache-files-*/

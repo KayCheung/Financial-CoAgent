@@ -1,5 +1,29 @@
 # Worktree Handoff - phase-1-stage-1
 
+## Latest Update
+
+- Confirmed `P1.2` first round is complete.
+- `P2.1 / T1.3 Semantic Router` is now in progress.
+- PostgreSQL now resolves through `app/core/database.py`.
+- Datasource config now prefers explicit `DATABASE_URL`, otherwise falls back to Nacos.
+- Nacos integration uses the official `nacos-sdk-python` SDK.
+- Added `server/app/agent/router.py` to replace the temporary hardcoded route branch.
+- `chat_runtime.py` now drives the main execution path through `prepare()` + `stream_response()`.
+- Local validated stack:
+  - PostgreSQL: `127.0.0.1:15432`
+  - Nacos: `127.0.0.1:8848`
+  - namespace: `dev`
+  - group: `DEFAULT_GROUP`
+  - dataId: `agent-datasource.yml`
+- Local created database:
+  - `financial_coagent_phase1`
+- Verified:
+  - `alembic upgrade head`
+  - `pytest -q`
+- Next implementation target:
+  - finish `P2.1 / T1.3 Semantic Router`
+  - then move into `P2.2 / T1.6 OCR`
+
 ## 基本信息
 
 - Worktree 路径：`E:/Workspace/CodeRepository/opensource/phase-1-stage-1`
@@ -52,6 +76,21 @@
 - 已支持超预算拦截
 - 测试通过
 
+`P0.3` 第一轮已完成：
+
+- 已新增独立 `AuditStore` / `AuditEntry` 模块
+- 已支持本地 WAL 文件落盘
+- 已支持热审计表写入
+- chat runtime 已对关键节点写审计
+- 测试通过
+
+`P1.1` 第一轮已完成：
+
+- 已引入可解析的开发态 token
+- 已将 `Principal` 扩展为带 `tenant_id / role`
+- 已将 tenant/role 上下文接入 chat 主链路
+- 测试通过
+
 当前还记录了两个必须后续清理的问题：
 
 - `AgentOrchestrator.stream()` 只是迁移期兼容入口，不是长期保留接口
@@ -97,14 +136,14 @@
 
 ## 当前暂停点
 
-暂停在“P0.2 第一轮完成，准备进入 P0.3 审计/WAL 基础骨架”的节点。
+暂停在“P1.1 第一轮完成，准备进入 P1.2 PostgreSQL 迁移准备”的节点。
 
 下一次恢复时，不要直接写代码，先完成：
 
 1. 阅读 `implementation-plan-phase-1-stage-1.md`
 2. 只聚焦一期实施方案中的 `T1.*`
-3. 从 `P0.3` 开始
-4. 将当前会话持久化与审计持久化分层
+3. 从 `P1.2` 开始
+4. 先把当前存储层整理到更接近 PostgreSQL 的形状
 
 ## 下一步
 
@@ -116,9 +155,9 @@
 
 输出目标：
 
-- 完成 `P0.3`
-- 搭出独立审计 entry 和本地 WAL 骨架
-- 让审计与会话消息持久化不再混为一层概念
+- 完成 `P1.2`
+- 让当前存储层摆脱 SQLite 心智依赖
+- 为 PG / RLS 接入提前整理字段和边界
 - 不破坏现有 SSE 协议和前端体验
 
 ## 恢复步骤
@@ -134,7 +173,7 @@
 4. 先看：
    - `当前暂停点`
    - `下一步`
-5. 然后从 `P0.3` 开始编码
+5. 然后从 `P1.2` 开始编码
 
 ## 工作习惯约定
 
@@ -155,4 +194,4 @@
 - worktree 已切换成功
 - 当前分支：`feature/phase-1-stage-1`
 - 当前工作区：已有本轮修改，未提交
-- 当前建议：继续按小型实施 Plan，进入 `P0.3`
+- 当前建议：继续按小型实施 Plan，进入 `P1.2`

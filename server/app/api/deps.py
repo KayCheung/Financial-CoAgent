@@ -4,16 +4,23 @@ from dataclasses import dataclass
 
 from fastapi import Depends
 
-from app.core.config import get_settings
-from app.core.security import verify_bearer
+from app.core.security_context import TokenContext, verify_bearer_context
 
 
 @dataclass
 class Principal:
     user_id: str
     name: str
+    tenant_id: str
+    role: str
+    raw_token: str
 
 
-def get_principal(_token: str = Depends(verify_bearer)) -> Principal:
-    settings = get_settings()
-    return Principal(user_id=settings.dev_user_id, name=settings.dev_user_name)
+def get_principal(token_context: TokenContext = Depends(verify_bearer_context)) -> Principal:
+    return Principal(
+        user_id=token_context.user_id,
+        name=token_context.user_name,
+        tenant_id=token_context.tenant_id,
+        role=token_context.role,
+        raw_token=token_context.raw_token,
+    )
