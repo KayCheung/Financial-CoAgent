@@ -1,30 +1,37 @@
 # 当前 Worktree 小型实施 Plan - phase-1-stage-1
 
-## Latest Status
+## 当前状态
 
-- `P0.1` complete
-- `P0.2` complete
-- `P0.3` complete
-- `P1.1` complete
-- `P1.2` first round complete
+- `P0.1` 已完成
+- `P0.2` 已完成
+- `P0.3` 已完成
+- `P1.1` 已完成
+- `P1.2` 第一轮已完成
+- `P2.1` 第一轮核心已完成
+- `P2.2` 第二轮进行中
 
-### P1.2 Completion Notes
+### P1.2 完成说明
 
-- Introduced unified database entrypoint: `server/app/core/database.py`
-- Datasource resolution order is now:
-  1. explicit `DATABASE_URL`
-  2. Nacos datasource YAML
-  3. sqlite fallback
-- Nacos client uses the official Python SDK, not a handwritten HTTP adapter
-- Alembic is wired to the unified database URL
-- `audit_entries` is now part of the migration chain
-- PostgreSQL migration path has been locally validated
+- 已引入统一数据库入口：`server/app/core/database.py`
+- 数据源解析顺序现为：
+  1. 显式 `DATABASE_URL`
+  2. Nacos 数据源 YAML
+  3. sqlite 回退
+- Nacos 客户端使用官方 Python SDK，不使用手写 HTTP 适配
+- Alembic 已接入统一数据库 URL
+- `audit_entries` 已纳入迁移链
+- PostgreSQL 迁移链路已在本地验证通过
 
-### Next Step
+### 当前约束
 
-- Continue `P2.1 / T1.3 Semantic Router`
-- Keep deleting dependence on the temporary keyword path instead of extending it
-- After router stabilization, move to `P2.2 / T1.6 OCR`
+- 如存在官方 SDK 或成熟、维护良好的开源 SDK，优先直接复用，不重复造轮子。
+- 阶段相关 md 文档新增内容统一使用中文，不再新增英文标题或状态块。
+
+### 下一步
+
+- 继续推进 `P2.2 / T1.6 OCR`
+- 保持 OCR 为真实工具执行步骤，而不是只在提示词里模拟
+- OCR 稳定后，继续清理 `P2.1` 的旧兼容路径
 
 ## 目标
 

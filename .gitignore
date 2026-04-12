@@ -211,5 +211,6 @@ server/coagent.db
 server/coagent.db-journal
 server/.nacos_runtime/
 server/pytest-cache-files-*/
+server/uploads/
 server/.nacos_runtime/
 server/pytest-cache-files-*/

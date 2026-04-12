@@ -1,28 +1,36 @@
-# Worktree Handoff - phase-1-stage-1
+# 阶段一交接 - phase-1-stage-1
 
-## Latest Update
+## 最新进展
 
-- Confirmed `P1.2` first round is complete.
-- `P2.1 / T1.3 Semantic Router` is now in progress.
-- PostgreSQL now resolves through `app/core/database.py`.
-- Datasource config now prefers explicit `DATABASE_URL`, otherwise falls back to Nacos.
-- Nacos integration uses the official `nacos-sdk-python` SDK.
-- Added `server/app/agent/router.py` to replace the temporary hardcoded route branch.
-- `chat_runtime.py` now drives the main execution path through `prepare()` + `stream_response()`.
-- Local validated stack:
-  - PostgreSQL: `127.0.0.1:15432`
-  - Nacos: `127.0.0.1:8848`
-  - namespace: `dev`
-  - group: `DEFAULT_GROUP`
-  - dataId: `agent-datasource.yml`
-- Local created database:
+- `P1.2` 第一轮已完成。
+- `P2.1 / T1.3 语义路由` 已完成第一轮核心落地，仍有兼容尾巴待清理。
+- `P2.2 / T1.6 OCR` 已进入第二轮，最小执行链和结构化字段抽取均已接通。
+- PostgreSQL 统一通过 `app/core/database.py` 解析。
+- 数据源配置优先使用显式 `DATABASE_URL`，否则回退到 Nacos。
+- Nacos 已使用官方 `nacos-sdk-python` SDK，不再自造 HTTP 客户端。
+- 已新增 `server/app/agent/router.py`，替换旧的临时硬编码路由分支。
+- `chat_runtime.py` 主链路已走 `prepare()` + `stream_response()`。
+- 已新增 `server/app/services/ocr_service.py`。
+- `invoice_ocr + attachments` 现在会产生独立 `ocr` 阶段，并将 OCR 文本和结构化字段注入最终回复上下文。
+- 本地验证环境：
+  - PostgreSQL：`127.0.0.1:15432`
+  - Nacos：`127.0.0.1:8848`
+  - namespace：`dev`
+  - group：`DEFAULT_GROUP`
+  - dataId：`agent-datasource.yml`
+- 本地数据库：
   - `financial_coagent_phase1`
-- Verified:
+- 已验证：
   - `alembic upgrade head`
   - `pytest -q`
-- Next implementation target:
-  - finish `P2.1 / T1.3 Semantic Router`
-  - then move into `P2.2 / T1.6 OCR`
+- 当前测试状态：
+  - `14 passed`
+- 下一步目标：
+  - 继续推进 `P2.2 / T1.6 OCR`
+  - 然后回头清理 `P2.1` 的旧兼容路径
+- 额外约束：
+  - 如有官方 SDK 或成熟、维护良好的开源 SDK，优先直接复用，不重复造轮子。
+  - 阶段相关 md 文档新增内容统一使用中文，不再新增英文标题或状态块。
 
 ## 基本信息
 

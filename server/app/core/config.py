@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     nacos_namespace: str = "dev"
     nacos_group: str = "DEFAULT_GROUP"
     nacos_datasource_data_id: str = "agent-datasource.yml"
+    remote_ocr_url: str | None = None
+    remote_ocr_token: str | None = None
 
     # S1 dev auth: replace with OIDC / enterprise SSO in S6.
     dev_bearer_token: str = "dev-local-token"

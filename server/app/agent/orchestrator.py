@@ -28,6 +28,7 @@ class StreamInput:
     session_id: str
     user_message: str
     history: list[ChatMessage]
+    attachments: list[dict] = field(default_factory=list)
     sent_prefix: str = ""
     tenant_id: str = "dev-tenant"
     user_id: str = "dev-user"
@@ -63,11 +64,13 @@ class OrchestratorState:
     user_id: str
     role: str
     user_message: str
+    attachments: list[dict]
     sent_prefix: str
     history: list[ChatMessage]
     route: RouteResult | None = None
     plan: ExecutionPlan | None = None
     current_stage: str | None = None
+    tool_context: dict[str, object] = field(default_factory=dict)
 
 
 class AgentOrchestrator:
@@ -97,6 +100,7 @@ class AgentOrchestrator:
             user_id=req.user_id,
             role=req.role,
             user_message=req.user_message,
+            attachments=req.attachments,
             sent_prefix=req.sent_prefix,
             history=req.history,
         )
@@ -137,18 +141,43 @@ class AgentOrchestrator:
 
     def _plan(self, state: OrchestratorState) -> ExecutionPlan:
         route = state.route or self._route(state)
-        steps = [
+        steps: list[PlanStep] = []
+        if route.intent == "invoice_ocr" and state.attachments:
+            steps.append(
+                PlanStep(
+                    key="ocr",
+                    label="票据OCR",
+                    kind="tool_call",
+                    summary="提取附件中的票据文本与结构化线索",
+                )
+            )
+        steps.append(
             PlanStep(
                 key="executor",
                 label="执行回复",
                 kind="llm_response",
                 summary=f"按 `{route.intent}` 路由结果组织上下文并生成回复",
             )
-        ]
+        )
         return ExecutionPlan(summary=f"已生成单步执行计划，当前意图为 `{route.intent}`", steps=steps)
 
     def _build_messages(self, state: OrchestratorState):
         messages = [SystemMessage(content=SYSTEM_PROMPT)]
+        ocr_results = state.tool_context.get("ocr_results")
+        if isinstance(ocr_results, list) and ocr_results:
+            ocr_lines = []
+            for item in ocr_results:
+                if isinstance(item, dict):
+                    fields = item.get("parsed_fields") or {}
+                    field_text = ", ".join(f"{key}={value}" for key, value in fields.items()) if isinstance(fields, dict) else ""
+                    line = f"- {item.get('file_name')}: {item.get('summary')}"
+                    if field_text:
+                        line += f" ({field_text})"
+                    ocr_lines.append(line)
+            if ocr_lines:
+                messages.append(
+                    SystemMessage(content="已提取附件OCR结果，请优先使用这些结果回答：\n" + "\n".join(ocr_lines))
+                )
         for item in state.history[-12:]:
             if not item.content.strip():
                 continue
@@ -166,6 +195,25 @@ class AgentOrchestrator:
             )
         messages.append(HumanMessage(content=user_input))
         return messages
+
+    def build_stub_reply(self, state: OrchestratorState) -> str:
+        route = state.route.intent if state.route else "general_chat"
+        if route == "invoice_ocr":
+            ocr_results = state.tool_context.get("ocr_results")
+            if isinstance(ocr_results, list) and ocr_results:
+                lines = ["已完成票据OCR预处理，识别结果如下："]
+                for item in ocr_results:
+                    if isinstance(item, dict):
+                        fields = item.get("parsed_fields") or {}
+                        lines.append(f"{item.get('file_name')}: {item.get('summary')}")
+                        if isinstance(fields, dict) and fields:
+                            for key, value in fields.items():
+                                lines.append(f"  {key}: {value}")
+                        extracted_text = item.get("extracted_text")
+                        if isinstance(extracted_text, str) and extracted_text:
+                            lines.append(f"  raw_text: {extracted_text}")
+                return "\n".join(lines)
+        return f"（S1 占位回复）已收到：{state.user_message}"
 
     @staticmethod
     def _build_model() -> ChatOpenAI:

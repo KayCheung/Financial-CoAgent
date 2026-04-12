@@ -9,6 +9,7 @@ from typing import Any
 
 from app.agent.orchestrator import OrchestratorState, StreamInput, agent_orchestrator
 from app.services.audit_store import AuditEntry, audit_store
+from app.services.ocr_service import ocr_service
 from app.services.session_store import ChatMessage, session_store
 from app.services.token_budget import BudgetExceededError, TokenBudget, token_budget_guard
 from app.services.usage_tracker import estimate_tokens, stub_cost_usd, usage_tracker
@@ -63,12 +64,9 @@ class ChatRuntime:
     def get_stage_snapshot(self, session_id: str) -> dict[str, Any] | None:
         return session_store.get_stage_snapshot(session_id)
 
-    @staticmethod
-    def _full_stub_reply(user_text: str) -> str:
-        return f"（S1 占位回复）已收到：{user_text}"
-
-    async def _stream_stub(self, user_snapshot: str, sent_prefix: str):
-        full = self._full_stub_reply(user_snapshot)
+    async def _stream_stub(self, state: OrchestratorState):
+        full = agent_orchestrator.build_stub_reply(state)
+        sent_prefix = state.sent_prefix
         if not full.startswith(sent_prefix):
             sent_prefix = ""
         rest = full[len(sent_prefix) :]
@@ -205,6 +203,7 @@ class ChatRuntime:
                     session_id=session_id,
                     user_message=user_snapshot,
                     history=history,
+                    attachments=attachments or [],
                     sent_prefix=sent_prefix,
                     tenant_id=tenant_id,
                     user_id=user_id,
@@ -273,6 +272,72 @@ class ChatRuntime:
                     "ended_at": self._now_iso(),
                 },
             )
+            if state.route and state.route.intent == "invoice_ocr" and attachments:
+                yield self._event(
+                    event_type="stage_started",
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    trace_id=trace_id,
+                    payload={
+                        "stage_key": "ocr",
+                        "stage_label": "票据OCR",
+                        "status": "running",
+                        "started_at": self._now_iso(),
+                    },
+                )
+                try:
+                    ocr_results = ocr_service.analyze_attachments(user_id=user_id, attachments=attachments or [])
+                    state.tool_context["ocr_results"] = [
+                        {
+                            "attachment_id": item.attachment_id,
+                            "file_name": item.file_name,
+                            "provider": item.provider,
+                            "summary": item.summary,
+                            "extracted_text": item.extracted_text,
+                            "parsed_fields": item.parsed_fields,
+                        }
+                        for item in ocr_results
+                    ]
+                    yield self._event(
+                        event_type="stage_completed",
+                        session_id=session_id,
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        trace_id=trace_id,
+                        payload={
+                            "stage_key": "ocr",
+                            "status": "completed",
+                            "tool_name": "ocr_service",
+                            "summary": f"已处理 {len(ocr_results)} 个附件",
+                            "ocr_results": [
+                                {
+                                    "attachment_id": item.attachment_id,
+                                    "file_name": item.file_name,
+                                    "provider": item.provider,
+                                    "summary": item.summary,
+                                    "parsed_fields": item.parsed_fields,
+                                }
+                                for item in ocr_results
+                            ],
+                            "ended_at": self._now_iso(),
+                        },
+                    )
+                except Exception as exc:
+                    yield self._event(
+                        event_type="stage_failed",
+                        session_id=session_id,
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        trace_id=trace_id,
+                        payload={
+                            "stage_key": "ocr",
+                            "status": "failed",
+                            "error_code": "OCR_EXECUTION_FAILED",
+                            "error_message": str(exc),
+                            "retryable": True,
+                        },
+                    )
             yield self._event(
                 event_type="stage_started",
                 session_id=session_id,
@@ -458,7 +523,7 @@ class ChatRuntime:
                         "recoverable": True,
                     },
                 )
-                async for piece in self._stream_stub(user_snapshot, sent_prefix):
+                async for piece in self._stream_stub(state):
                     if cancel.is_set():
                         break
                     output_parts.append(piece)
