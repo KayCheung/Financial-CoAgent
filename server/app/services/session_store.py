@@ -110,6 +110,7 @@ class SessionStore:
         self._engine = create_engine(db_url, future=True, connect_args=connect_args)
         self._session_factory = sessionmaker(self._engine, expire_on_commit=False, class_=Session)
         self._seq_cursor: dict[str, int] = {}
+        Base.metadata.create_all(self._engine)
 
     def _db(self) -> Session:
         return self._session_factory()

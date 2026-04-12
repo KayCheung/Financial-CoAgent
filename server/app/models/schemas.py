@@ -101,3 +101,31 @@ class UsageSummaryItem(BaseModel):
 class UsageSummaryResponse(BaseModel):
     items: list[UsageSummaryItem]
     totals: dict[str, Any]
+
+
+class RunStageSnapshot(BaseModel):
+    stage_key: str
+    stage_label: str
+    status: str
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    duration_ms: int | None = None
+    tool_name: str | None = None
+    summary: str = ""
+    error: str | None = None
+    error_code: str | None = None
+    retryable: bool | None = None
+    percent: int | None = None
+    approval_payload: dict[str, Any] | None = None
+
+
+class RunSnapshot(BaseModel):
+    session_id: str
+    thread_id: str
+    run_id: str | None = None
+    status: str = "running"
+    trace_id: str | None = None
+    stages: list[RunStageSnapshot] = Field(default_factory=list)
+    last_event_id: str | None = None
+    final_answer: str = ""
+    updated_at: datetime | None = None

@@ -7,8 +7,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from app.agent.orchestrator import StreamInput, agent_orchestrator
+from app.agent.orchestrator import OrchestratorState, StreamInput, agent_orchestrator
 from app.services.session_store import ChatMessage, session_store
+from app.services.token_budget import BudgetExceededError, TokenBudget, token_budget_guard
 from app.services.usage_tracker import estimate_tokens, stub_cost_usd, usage_tracker
 
 
@@ -25,6 +26,8 @@ class Checkpoint:
 class ActiveRun:
     run_id: str
     cancel: asyncio.Event
+    state: OrchestratorState | None = None
+    budget: TokenBudget | None = None
 
 
 class ChatRuntime:
@@ -168,7 +171,7 @@ class ChatRuntime:
             prev = self._active.get(session_id)
             if prev:
                 prev.cancel.set()
-            self._active[session_id] = ActiveRun(run_id=run_id, cancel=cancel)
+            self._active[session_id] = ActiveRun(run_id=run_id, cancel=cancel, state=None, budget=None)
 
         if append_user:
             session_store.append_message(
@@ -189,6 +192,82 @@ class ChatRuntime:
         input_toks = estimate_tokens(" ".join(m.content for m in history))
 
         try:
+            budget = token_budget_guard.allocate(session_id=session_id, user_id=user_id, complexity="simple")
+            _, emit_warning = token_budget_guard.consume_input(
+                budget,
+                " ".join(m.content for m in history) + " " + user_snapshot,
+            )
+            state = agent_orchestrator.prepare(
+                StreamInput(
+                    session_id=session_id,
+                    user_message=user_snapshot,
+                    history=history,
+                    sent_prefix=sent_prefix,
+                    user_id=user_id,
+                )
+            )
+            async with self._lock:
+                current = self._active.get(session_id)
+                if current and current.run_id == run_id:
+                    current.state = state
+                    current.budget = budget
+
+            yield self._event(
+                event_type="budget_event",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={
+                    "status": "allocated",
+                    "complexity": budget.complexity,
+                    "total_budget": budget.total_budget,
+                    "consumed_tokens": budget.consumed,
+                    "remaining_tokens": budget.remaining,
+                },
+            )
+            if emit_warning:
+                yield self._event(
+                    event_type="budget_event",
+                    session_id=session_id,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    trace_id=trace_id,
+                    payload={
+                        "status": "warning",
+                        "complexity": budget.complexity,
+                        "total_budget": budget.total_budget,
+                        "consumed_tokens": budget.consumed,
+                        "remaining_tokens": budget.remaining,
+                    },
+                )
+
+            yield self._event(
+                event_type="stage_started",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={
+                    "stage_key": "router",
+                    "stage_label": "意图路由",
+                    "status": "running",
+                    "started_at": self._now_iso(),
+                },
+            )
+            yield self._event(
+                event_type="stage_completed",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={
+                    "stage_key": "router",
+                    "status": "completed",
+                    "summary": state.route.summary if state.route else "完成路由判定",
+                    "ended_at": self._now_iso(),
+                },
+            )
             yield self._event(
                 event_type="stage_started",
                 session_id=session_id,
@@ -211,7 +290,7 @@ class ChatRuntime:
                 payload={
                     "stage_key": "planner",
                     "status": "completed",
-                    "summary": "完成上下文与工具策略规划",
+                    "summary": state.plan.summary if state.plan else "完成上下文与工具策略规划",
                     "ended_at": self._now_iso(),
                 },
             )
@@ -222,8 +301,8 @@ class ChatRuntime:
                 run_id=run_id,
                 trace_id=trace_id,
                 payload={
-                    "stage_key": "responder",
-                    "stage_label": "生成回复",
+                    "stage_key": "executor",
+                    "stage_label": "执行回复",
                     "status": "running",
                     "started_at": self._now_iso(),
                 },
@@ -236,8 +315,9 @@ class ChatRuntime:
                         user_message=user_snapshot,
                         history=history,
                         sent_prefix=sent_prefix,
+                        user_id=user_id,
                     ),
-                    cancel=cancel,
+                    cancel,
                 ):
                     if cancel.is_set():
                         partial = sent_prefix + "".join(output_parts)
@@ -261,7 +341,7 @@ class ChatRuntime:
                             run_id=run_id,
                             trace_id=trace_id,
                             payload={
-                                "stage_key": "responder",
+                                "stage_key": "executor",
                                 "status": "failed",
                                 "error_code": "INTERRUPTED",
                                 "error_message": "用户主动中断当前生成",
@@ -299,9 +379,65 @@ class ChatRuntime:
                             run_id=run_id,
                             trace_id=trace_id,
                             payload={
-                                "stage_key": "responder",
+                                "stage_key": "executor",
                                 "summary": "正在流式生成答案",
                                 "percent": 60,
+                            },
+                        )
+                    try:
+                        _, emit_warning = token_budget_guard.consume_output(budget, piece)
+                    except BudgetExceededError as exc:
+                        partial = sent_prefix + "".join(output_parts)
+                        yield self._event(
+                            event_type="stage_failed",
+                            session_id=session_id,
+                            thread_id=thread_id,
+                            run_id=run_id,
+                            trace_id=trace_id,
+                            payload={
+                                "stage_key": "executor",
+                                "status": "failed",
+                                "error_code": "TOKEN_BUDGET_EXCEEDED",
+                                "error_message": str(exc),
+                                "retryable": False,
+                            },
+                        )
+                        yield self._event(
+                            event_type="budget_event",
+                            session_id=session_id,
+                            thread_id=thread_id,
+                            run_id=run_id,
+                            trace_id=trace_id,
+                            payload={
+                                "status": "blocked",
+                                "complexity": budget.complexity,
+                                "total_budget": budget.total_budget,
+                                "consumed_tokens": budget.consumed,
+                                "remaining_tokens": budget.remaining,
+                            },
+                        )
+                        yield self._event(
+                            event_type="completed",
+                            session_id=session_id,
+                            thread_id=thread_id,
+                            run_id=run_id,
+                            trace_id=trace_id,
+                            payload={"status": "failed", "final_answer": partial},
+                        )
+                        return
+                    if emit_warning:
+                        yield self._event(
+                            event_type="budget_event",
+                            session_id=session_id,
+                            thread_id=thread_id,
+                            run_id=run_id,
+                            trace_id=trace_id,
+                            payload={
+                                "status": "warning",
+                                "complexity": budget.complexity,
+                                "total_budget": budget.total_budget,
+                                "consumed_tokens": budget.consumed,
+                                "remaining_tokens": budget.remaining,
                             },
                         )
                     yield self._event(
@@ -369,7 +505,7 @@ class ChatRuntime:
                 run_id=run_id,
                 trace_id=trace_id,
                 payload={
-                    "stage_key": "responder",
+                    "stage_key": "executor",
                     "status": "completed",
                     "summary": "回复生成完成",
                     "ended_at": self._now_iso(),
@@ -391,6 +527,20 @@ class ChatRuntime:
                 },
             )
             yield self._event(
+                event_type="budget_event",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={
+                    "status": "completed",
+                    "complexity": budget.complexity,
+                    "total_budget": budget.total_budget,
+                    "consumed_tokens": budget.consumed,
+                    "remaining_tokens": budget.remaining,
+                },
+            )
+            yield self._event(
                 event_type="completed",
                 session_id=session_id,
                 thread_id=thread_id,
@@ -400,6 +550,28 @@ class ChatRuntime:
             )
             if resume_token:
                 session_store.mark_checkpoint_consumed(resume_token)
+        except BudgetExceededError as exc:
+            yield self._event(
+                event_type="error",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={
+                    "status": "failed",
+                    "error_code": "TOKEN_BUDGET_EXCEEDED",
+                    "error_message": str(exc),
+                    "recoverable": False,
+                },
+            )
+            yield self._event(
+                event_type="completed",
+                session_id=session_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                trace_id=trace_id,
+                payload={"status": "failed"},
+            )
         except Exception as exc:
             yield self._event(
                 event_type="error",
