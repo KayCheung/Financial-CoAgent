@@ -122,15 +122,6 @@ class AgentOrchestrator:
             if isinstance(text, str) and text:
                 yield text
 
-    async def stream(self, req: StreamInput, cancel):
-        """
-        向后兼容旧调用方式。
-        后续新代码优先使用 `prepare()` + `stream_response()`。
-        """
-        state = self.prepare(req)
-        async for text in self.stream_response(state, cancel):
-            yield text
-
     def _route(self, state: OrchestratorState) -> RouteResult:
         decision = semantic_router.route(state.user_message)
         return RouteResult(
